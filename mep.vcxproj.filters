@@ -1,0 +1,68 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="inc">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
+    </Filter>
+    <Filter Include="src">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="cgen">
+      <UniqueIdentifier>{d3f49831-8f7b-46fd-8f41-139153182725}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="cgen\cgen">
+      <UniqueIdentifier>{62dc3ede-afb8-47c2-826e-95fa923ad8e6}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="mep.hpp">
+      <Filter>inc</Filter>
+    </ClInclude>
+    <ClInclude Include="ins.hpp">
+      <Filter>inc</Filter>
+    </ClInclude>
+    <ClInclude Include="reg.hpp">
+      <Filter>inc</Filter>
+    </ClInclude>
+    <ClInclude Include="cgen\basic-modes.h">
+      <Filter>cgen\cgen</Filter>
+    </ClInclude>
+    <ClInclude Include="cgen\basic-ops.h">
+      <Filter>cgen\cgen</Filter>
+    </ClInclude>
+    <ClInclude Include="cgen\bitset.h">
+      <Filter>cgen\cgen</Filter>
+    </ClInclude>
+    <ClInclude Include="cgen\engine.h">
+      <Filter>cgen\cgen</Filter>
+    </ClInclude>
+    <ClInclude Include="cgen.h">
+      <Filter>cgen</Filter>
+    </ClInclude>
+    <ClInclude Include="symcat.h">
+      <Filter>cgen</Filter>
+    </ClInclude>
+    <ClInclude Include="bfd_stdint.h">
+      <Filter>cgen</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="ana.cpp">
+      <Filter>src</Filter>
+    </ClCompile>
+    <ClCompile Include="emu.cpp">
+      <Filter>src</Filter>
+    </ClCompile>
+    <ClCompile Include="reg.cpp">
+      <Filter>src</Filter>
+    </ClCompile>
+    <ClCompile Include="ins.cpp">
+      <Filter>src</Filter>
+    </ClCompile>
+    <ClCompile Include="out.cpp">
+      <Filter>src</Filter>
+    </ClCompile>
+  </ItemGroup>
+</Project>
