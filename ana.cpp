@@ -2419,9 +2419,9 @@ int mep_t::mep_ana(insn_t *_insn)
   f_24u8n = ((((f_24u8n_hi) << (8))) | (f_24u8n_lo));
 
     /* Record the operands  */
-    ida_insn.Op2.type = o_imm;
+    ida_insn.Op2.type = o_mem;
     ida_insn.Op2.dtype = get_dtype_by_size(4);
-    ida_insn.Op2.value = f_24u8n;
+    ida_insn.Op2.addr = f_24u8n;
     ida_insn.Op2.cgen_optype = MEP_OPERAND_UIMM24;
     ida_insn.Op1.type = o_reg;
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn3;
@@ -2441,17 +2441,23 @@ int mep_t::mep_ana(insn_t *_insn)
 
  extract_sfmt_movu16:
   {
-    CGEN_INSN_WORD insn = entire_insn;
-    UINT f_rn;
-    UINT f_16u16;
+      CGEN_INSN_WORD insn = entire_insn;
+      UINT f_rn;
+      UINT f_16u16;
 
-    f_rn = EXTRACT_MSB0_UINT (insn, 32, 4, 4);
-    f_16u16 = EXTRACT_MSB0_UINT (insn, 32, 16, 16);
+      f_rn = EXTRACT_MSB0_UINT(insn, 32, 4, 4);
+      f_16u16 = EXTRACT_MSB0_UINT(insn, 32, 16, 16);
 
-    /* Record the operands  */
-    ida_insn.Op2.type = o_imm;
-    ida_insn.Op2.dtype = get_dtype_by_size(4);
-    ida_insn.Op2.value = f_16u16;
+      /* Record the operands  */
+      ida_insn.Op2.type = o_imm;
+      ida_insn.Op2.dtype = get_dtype_by_size(4);
+      if (itype == MEP_INSN_MOVH) {
+          ida_insn.Op2.value = f_16u16<<16;
+      }
+      else
+      {
+          ida_insn.Op2.value = f_16u16;
+      }
     ida_insn.Op2.cgen_optype = MEP_OPERAND_UIMM16;
     ida_insn.Op1.type = o_reg;
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn;
@@ -2461,7 +2467,14 @@ int mep_t::mep_ana(insn_t *_insn)
     if (get_refinfo(&ri, ida_insn.ea, 1))
     {
       ida_insn.Op2.type = o_mem;
-      ida_insn.Op2.addr = calc_reference_target(ida_insn.ea, ri, f_16u16);
+      if (itype == MEP_INSN_MOVH)
+      {
+          ida_insn.Op2.addr = calc_reference_target(ida_insn.ea, ri, f_16u16<<16);
+      }
+      else
+      {
+          ida_insn.Op2.addr = calc_reference_target(ida_insn.ea, ri, f_16u16);
+      }
     }
 
     ida_insn.itype = itype;

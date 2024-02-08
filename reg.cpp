@@ -87,7 +87,12 @@ ssize_t idaapi mep_t::on_event(ssize_t msgid, va_list va)
         const op_t *op = va_arg(va, const op_t *);
         return can_have_type(*op) ? 1 : -1;
       }
-
+    case processor_t::ev_is_switch:
+    {
+        switch_info_t* si = va_arg(va, switch_info_t*);
+        const insn_t* insn = va_arg(va, const insn_t*);
+        return mep_is_switch(si, *insn) ? 1 : -1;
+    }
     case processor_t::ev_loader_elf_machine:
       {
         linput_t *li = va_arg(va, linput_t *);

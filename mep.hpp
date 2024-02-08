@@ -200,7 +200,7 @@ struct mep_t : public procmod_t
     idb_listener_t idb_listener = idb_listener_t(*this);
     
     virtual ssize_t idaapi on_event(ssize_t msgid, va_list va) override;
-    
+    bool mep_is_switch(switch_info_t* si, const insn_t& insn);
     int mep_ana(insn_t* _insn);
     int mep_emu(const insn_t& insn);
 };

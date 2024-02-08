@@ -131,7 +131,7 @@ instruc_t Instructions[] = {
   { "bne",    CF_USE1|CF_USE2|CF_USE3 }, //bne $rn,$rm,$pcrel17a2
   { "bsr",    CF_CALL|CF_USE1 }, //bsr $pcrel12a2
   { "bsr",    CF_CALL|CF_USE1 }, //bsr $pcrel24a2
-  { "jmp",    CF_CALL|CF_STOP|CF_USE1 }, //jmp $rm
+  { "jmp",    CF_CALL|CF_STOP|CF_USE1 | CF_JUMP }, //jmp $rm
   { "jmp",    CF_CALL|CF_STOP|CF_USE1 }, //jmp $pcabs24a2
   { "jsr",    CF_CALL|CF_USE1 }, //jsr $rm
   { "ret",    CF_STOP }, //ret

@@ -11,6 +11,8 @@ This file is part of the Red Hat simulators.
 
 #pragma warning ( disable : 4146)
 #include "mep.hpp"
+unsigned long g_rptail = 0;
+unsigned long g_rpb = 0;
 
 static void make_stack_var(const insn_t &insn, const op_t &x)
 {
@@ -30,6 +32,199 @@ static void add_sp(const insn_t &insn, sval_t delta)
   {
     add_auto_stkpnt(pfn, insn.ea+insn.size, delta);
   }
+}
+/*
+*  Example Switch from AM32 module
+*
+.text:0000893C                 mvi     r3, 4
+.text:00008940                 addi    r4, r5, -1
+.text:00008944                 bgu     r4, r3, loc_8A50
+.text:00008948                 mvhi    r3, 1
+.text:0000894C                 sli     r4, r4, 2
+.text:00008950                 ori     r3, r3, low16(unk_18480)
+.text:00008954                 add     r3, r3, r4
+.text:00008958                 lw      r3, (r3+0)
+.text:0000895C                 b       r3
+*/
+/*
+ROM:80BD0C                 mov     $0, 4
+ROM:80BD0E                 mov     $6, $1
+ROM:80BD10                 sltu3   $0, $0, $3
+ROM:80BD12                 add3    $5, $1, 0x40
+ROM:80BD16                 bnei    $0, 0, loc_80BE90
+ROM:80BD1A                 sll     $3, 2
+ROM:80BD1C                 movu    $2, 0x2CB8
+ROM:80BD20                 add3    $3, $2, $3
+ROM:80BD22                 lw      $3, ($3)
+ROM:80BD24                 jmp     $3
+*/
+
+static size_t get_switch_entries(const insn_t& insn)
+{
+    size_t entries = 0;
+    bool found = false;
+    insn_t prev;
+    ea_t prev_ea;
+    uint16 sll_reg = 0xFFFF, stlu3_reg = 0xFFFF;
+    prev_ea = decode_prev_insn(&prev, insn.ea);
+    for (int i = 0; i < 0x30; i++)
+    {
+        switch (prev.itype)
+        {
+        case MEP_INSN_SLLI:
+            if (prev.Op2.value == 2)
+            {
+                //msg("Found switch entires ssl at 0x%x\n", prev.ea);
+                sll_reg = prev.Op1.reg;
+            }
+            //check for shift left 2 and get reg
+            break;
+        case MEP_INSN_SLTU3:
+            if (prev.Op2.reg == sll_reg && sll_reg != 0xFFFF)
+            {
+                //msg("Found switch entires sltu3 at 0x%x\n", prev.ea);
+                stlu3_reg = prev.Op1.reg;
+                //entries = 1 + prev.Op3.value;
+                //found = true;
+            }
+            break;
+        case MEP_INSN_MOVI8:
+            if (prev.Op1.reg == stlu3_reg && stlu3_reg != 0xFFFF)
+            {
+                //msg("Found switch entires mov at 0x%x\n", prev.ea);
+                entries =  prev.Op2.value +1;
+                found = true;
+
+            }
+            break;
+        default:
+            break;
+        }
+        if (found) break;
+        else prev_ea = decode_prev_insn(&prev, prev_ea);
+
+    }
+    //msg("Found 0x%x table entries\n", entries);
+    return entries;
+}
+static ea_t get_switch_table_addr(const insn_t& insn)
+{
+    ea_t table = BADADDR;
+    bool found = false;
+    insn_t prev;
+    ea_t prev_ea;
+    uint16 add_reg = 0xFFFF;
+    prev_ea = decode_prev_insn(&prev, insn.ea);
+    for (int i = 0; i < 0x30; i++)
+    {
+        switch (prev.itype)
+        {
+        case MEP_INSN_ADD3:
+            if ((prev.Op1.reg == prev.Op3.reg) && (prev.Op1.reg == insn.Op1.reg))
+            {
+                add_reg = prev.Op2.reg;
+            }
+
+            break;
+        case MEP_INSN_MOVU24:
+            if ((prev.Op1.reg == add_reg) && (add_reg != 0xFFFF))
+            {
+                table = prev.Op2.addr;
+                //msg("Found at address 0x%x jumptable value 0x%x\n", prev.ea, table);
+                found = true;
+            }
+            break;
+        case MEP_INSN_ADD3X:
+            if ((prev.Op1.reg == add_reg)  && (prev.Op2.reg == add_reg) && (add_reg != 0xFFFF))
+            {
+                table = prev.Op3.addr;
+                //msg("Found at address 0x%x jumptable value 0x%x\n", prev.ea, table);
+                found = true;
+            }
+            break;
+        default:
+            break;
+        }
+        if (found) break;
+        else prev_ea = decode_prev_insn(&prev, prev_ea);
+    }
+    //msg("jump table at 0x%x\n", table);
+    return table;
+}
+static ea_t get_switch_default_addr(const insn_t& insn)
+{
+    ea_t defjump = BADADDR, maybe = BADADDR;
+    //msg("In get_switch_default_addr\n");
+    bool found = false;
+    insn_t prev;
+    ea_t prev_ea;
+    uint16 sll_reg = 0xFFFF, bnei_reg = 0xFFFF;
+    prev_ea = decode_prev_insn(&prev, insn.ea);
+    for (int i = 0; i < 0x30; i++)
+    {
+        switch (prev.itype)
+        {
+        case MEP_INSN_SLLI:
+            if (prev.Op2.value == 2)
+            {
+                sll_reg = prev.Op1.reg;
+            }
+            //check for shift left 2 and get reg
+            break;
+        case MEP_INSN_BNEI:
+            maybe = prev.Op3.addr;
+            bnei_reg = prev.Op1.reg;
+            break;
+        case MEP_INSN_SLTU3:
+            if (prev.Op2.reg == sll_reg && sll_reg != 0xFFFF && bnei_reg == 1)
+            {
+                defjump = maybe;
+                found = true;
+                //entries = 1 + prev.Op3.value;
+                //found = true;
+            }
+            break;
+
+        default:
+            break;
+        }
+        if (found) break;
+        else prev_ea = decode_prev_insn(&prev, prev_ea);
+    }
+    //msg("defaddress = 0x%x\n", defjump);
+    return defjump;
+}
+bool mep_t::mep_is_switch(switch_info_t* si, const insn_t& insn) {
+    if (insn.Op1.type == o_reg && insn.Op1.reg < 12)
+    {
+        // Find the values needed to create the switch.
+        size_t num_entries;
+        ea_t jump_table_addr;
+        ea_t default_addr;
+
+        // if we find everything we need then set the values and return true so IDA creates the switch
+        num_entries = get_switch_entries(insn);
+        jump_table_addr = get_switch_table_addr(insn);
+        default_addr = get_switch_default_addr(insn);
+
+        if (num_entries > 1 && jump_table_addr != BADADDR && default_addr != BADADDR)
+        {
+
+            si->set_jtable_element_size(4);  // 4 bytes for 32-bit pointers in the table on MEP
+            si->set_jtable_size(num_entries);
+            si->startea = insn.ea;
+            si->jumps = jump_table_addr;
+            si->set_shift(0);  // No shift operation on the index
+            si->set_elbase(0);  // No base address for the jump table elements
+            si->defjump = default_addr;
+            si->regnum = insn.Op1.reg;
+
+            return true;
+        }
+    }
+
+    return false;
+
 }
 
 // ********** x-invalid: --invalid--
@@ -956,6 +1151,28 @@ mep_emu_movh (const insn_t &insn)
   return 4;
 }
 
+/*
+static int mep_emu_movh(const insn_t& insn)
+{
+    ea_t pc = insn.ea; // Effective address
+    int valid = 1;     // Validity flag
+
+    // Determine the value to shift based on insn.Op2.type and perform the shift
+    // Note: The shifted value is not being used or stored
+    if (insn.Op2.type == o_imm)
+    {
+        // Perform the shift operation with insn.Op2.value, result is not stored
+        insn.Op2.value << 16;
+    }
+    else
+    {
+        // Perform the shift operation with insn.Op2.addr, result is not stored
+        insn.Op2.addr << 16;
+    }
+
+    return 4;
+}
+*/
 // ********** add3: add3 $rl,$rn,$rm
 
 static int
@@ -1669,14 +1886,23 @@ static int
 mep_emu_repeat (const insn_t &insn)
 {
   ea_t pc = insn.ea;
-  int valid = 1;
+  insn_t rpb_insn, rpe_insn,tail_insn;
+  int len;
+  ea_t rpb, rpe;
+  rpb = pc + insn.size;
+  rpe = insn.Op2.addr; // Address of the end of the loop block sort of, the real end is the next instruction after the address specified here
+  len = decode_insn(&rpb_insn, rpb);
+  if (len <= 0) return 4;
+  len = decode_insn(&rpe_insn, rpe);
+  if (len <= 0) return 4;
+  len = decode_insn(&tail_insn, rpe + len);
+  if (len <= 0) return 4;
 
-{
-ADDSI (pc, 4);
-((insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr) & ((~ (1))));
-[&](){ valid = 0; return 0; }();
-}
-
+  //msg("creating cref at 0x%x to 0x%x\n", tail_insn.ea, insn.ea);
+  //tail_insn.add_cref(rpb, 0, fl_JN);
+  //insn_add_cref(insn, tail_insn.ea, 0, fl_JN);
+  g_rptail = tail_insn.ea;
+  g_rpb = rpb_insn.ea;
   return 4;
 }
 
@@ -1685,17 +1911,30 @@ ADDSI (pc, 4);
 static int
 mep_emu_erepeat (const insn_t &insn)
 {
-  ea_t pc = insn.ea;
-  int valid = 1;
+    ea_t pc = insn.ea;
+    insn_t rpb_insn, rpe_insn, tail_insn;
+    int len;
+    ea_t rpb, rpe;
+    rpb = pc + insn.size;
+    rpe = insn.Op1.addr; // Address of the end of the loop block sort of, the real end is the next instruction after the address specified here
+    //msg("target address = 0x%x\n", rpe);
+    len = decode_insn(&rpb_insn, rpb);
+    if (len <= 0) return 4;
+    len = decode_insn(&rpe_insn, rpe);
+    if (len <= 0) return 4;
+    len = decode_insn(&tail_insn, rpe + len);
+    if (len <= 0) return 4;
+    //msg("creating cref at 0x%x to 0x%x\n", tail_insn.ea, insn.ea);
+    //tail_insn.add_cref(rpb, 0, fl_JN);
+    g_rptail = tail_insn.ea;
+    g_rpb = rpb_insn.ea;
+    //msg("creating cref at 0x%x to 0x%x\n", insn.ea, tail_insn.ea);
+    //insn_add_cref(insn, tail_insn.ea, 0, fl_JN);
+            
 
-{
-ADDSI (pc, 4);
-((insn.Op1.type == o_imm ? insn.Op1.value : insn.Op1.addr) & ((~ (1))));
-ORSI (ANDSI ([&](){ valid = 0; return 0; }(), (~ (((1) << (0))))), ((((1) << (0))) & (((1) << (0)))));
-1;
-}
+    
 
-  return 4;
+    return 4;
 }
 
 // ********** stc_lp: stc $rn,\$lp
@@ -3868,5 +4107,13 @@ int mep_t::mep_emu(const insn_t &insn)
   } else if (may_trace_sp()) {
     recalc_spd(insn.ea);
   }
+
+  if (insn.ea == g_rptail)
+  {
+      add_cref(g_rptail, g_rpb, fl_JN);
+      g_rptail = 0;
+      g_rpb = 0;
+  }
+
   return 1;
 }
