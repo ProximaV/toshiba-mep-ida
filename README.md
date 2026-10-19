@@ -3,6 +3,7 @@
 This is a processor module for MeP mostly generated from 
 [CGEN](https://github.com/yifanlu/cgen).
 
+Using this [sdk](https://github.com/HexRaysSA/ida-sdk)
 ## Features
 
 * Analysis of the core instruction set + C5 additions
