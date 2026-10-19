@@ -19,14 +19,8 @@ static bool idaapi can_have_type(const op_t &x)      // returns 1 - operand can 
 }
 
 //--------------------------------------------------------------------------
-ssize_t idaapi idb_listener_t::on_event(ssize_t code, va_list)
+ssize_t idaapi idb_listener_t::on_event(ssize_t /*code*/, va_list)
 {
-    switch (code)
-    {
-    // add stuff here...
-    default:
-        break;
-    }
     return 0;
 }
 
@@ -40,23 +34,48 @@ static ssize_t idaapi notify(void*, int msgid, va_list)
     return 0;
 }
 
+void mep_t::set_repeat_loop(ea_t tail_ea, ea_t rpb_ea, bool is_erepeat)
+{
+  if ( tail_ea == BADADDR || rpb_ea == BADADDR )
+    return;
+  uval_t encoded = (rpb_ea & ~uval_t(1)) | (is_erepeat ? 1 : 0);
+  helper.altset(tail_ea, encoded, 'R');
+}
+
+bool mep_t::get_repeat_loop(ea_t tail_ea, ea_t *p_rpb_ea, bool *p_is_erepeat) const
+{
+  uval_t encoded = helper.altval(tail_ea, 'R');
+  if ( encoded == 0 )
+    return false;
+  if ( p_rpb_ea != nullptr )
+    *p_rpb_ea = ea_t(encoded & ~uval_t(1));
+  if ( p_is_erepeat != nullptr )
+    *p_is_erepeat = (encoded & 1) != 0;
+  return true;
+}
+
 ssize_t idaapi mep_t::on_event(ssize_t msgid, va_list va)
 {
   int code = 0;
 
   switch ( msgid )
   {
-  case processor_t::ev_init:
+    case processor_t::ev_init:
+      helper.create("$ mep");
       hook_event_listener(HT_IDB, &idb_listener, &LPH);
       inf_set_be(false);       // Set a little endian mode of the IDA kernel
       break;
 
-  case processor_t::ev_term:
+    case processor_t::ev_term:
       unhook_event_listener(HT_IDB, &idb_listener);
       clr_module_data(data_id);
       break;
 
-  case processor_t::ev_ana_insn:
+    case processor_t::ev_privrange_changed:
+      helper.create("$ mep");
+      break;
+
+    case processor_t::ev_ana_insn:
       {
         insn_t *out = va_arg(va, insn_t *);
         return mep_ana(out);
@@ -87,19 +106,43 @@ ssize_t idaapi mep_t::on_event(ssize_t msgid, va_list va)
         const op_t *op = va_arg(va, const op_t *);
         return can_have_type(*op) ? 1 : -1;
       }
+
+    case processor_t::ev_is_sp_based:
+      {
+        int *mode = va_arg(va, int *);
+        const insn_t *insn = va_arg(va, const insn_t *);
+        const op_t *op = va_arg(va, const op_t *);
+        *mode = is_sp_based(*insn, *op);
+        return 1;
+      }
+
+    case processor_t::ev_create_function_frame:
+      {
+        ea_t func_ea = va_arg(va, ea_t);
+        return create_func_frame(func_ea) ? 1 : 0;
+      }
+
+    case processor_t::ev_get_function_retsize:
+      {
+        int *frsize = va_arg(va, int *);
+        *frsize = 0; // MeP stores return address in $lp, not on stack at call
+        return 1;
+      }
+
     case processor_t::ev_is_switch:
-    {
-        switch_info_t* si = va_arg(va, switch_info_t*);
-        const insn_t* insn = va_arg(va, const insn_t*);
+      {
+        switch_info_t *si = va_arg(va, switch_info_t *);
+        const insn_t *insn = va_arg(va, const insn_t *);
         return mep_is_switch(si, *insn) ? 1 : -1;
-    }
+      }
+
     case processor_t::ev_loader_elf_machine:
       {
         linput_t *li = va_arg(va, linput_t *);
         int machine_type = va_arg(va, int);
         const char **p_procname = va_arg(va, const char **);
         (void)li; // unused variable
-        if (machine_type == 0xF00D)
+        if ( machine_type == 0xF00D )
         {
           *p_procname = "MeP";
           code = 0xF00D;
@@ -110,7 +153,6 @@ ssize_t idaapi mep_t::on_event(ssize_t msgid, va_list va)
     default:
       break;
   }
-  va_end(va);
 
   return code;
 }
@@ -138,7 +180,7 @@ static const asm_t mepasm =
   ".dword",     // dword  (4 bytes)
   ".qword",     // qword  (8 bytes)
   NULL,         // oword  (16 bytes)
-  ".float"      // float  (4 bytes)
+  ".float",     // float  (4 bytes)
   ".double",    // double (8 bytes)
   NULL,         // tbyte  (10/12 bytes)
   NULL,         // packed decimal real
@@ -172,11 +214,13 @@ static const asm_t mepasm =
 static const asm_t *const asms[] = { &mepasm, NULL };
 
 //-----------------------------------------------------------------------
-static const uchar retcode_1[] = { 0x02, 0x70 };
+static const uchar retcode_1[] = { 0x02, 0x70 }; // ret
+static const uchar retcode_2[] = { 0x12, 0x70 }; // reti
 
 static const bytes_t retcodes[] =
 {
   { sizeof(retcode_1), retcode_1 },
+  { sizeof(retcode_2), retcode_2 },
   { 0, NULL }
 };
 
@@ -231,10 +275,10 @@ processor_t LPH =
   NULL,                 // No known code start sequences
   retcodes,             // 'Return' instruction codes
 
-  0, MEP_INSN_RI_26+1,
+  0, MEP_INSN_LAST,
   Instructions,         // instruc
   0,                    // int tbyte_size;  -- doesn't exist
-  { 0, 0, 0, 0 },       // char real_width[4];
+  { 0, 7, 15, 0 },      // char real_width[4];
                         // number of symbols after decimal point
                         // 2byte float (0-does not exist)
                         // normal float

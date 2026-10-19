@@ -384,7 +384,14 @@ bool out_mep_t::cgen_outop(const op_t &x, uint16 opindex, ea_t pc)
       out_register(ph.reg_names[x.reg]);
       break;
     case MEP_OPERAND_SDISP16 :
-      out_value(x, OOF_SIGNED|OOF_NUMBER|OOFW_IMM);
+      if (x.type == o_mem)
+      {
+        out_print_address(x, pc, x.n);
+      }
+      else
+      {
+        out_value(x, OOF_SIGNED|OOF_NUMBER|OOFW_IMM);
+      }
       break;
     case MEP_OPERAND_SIMM16 :
       if (x.type == o_imm)
@@ -430,13 +437,16 @@ bool out_mep_t::cgen_outop(const op_t &x, uint16 opindex, ea_t pc)
       out_value(x, OOF_SIGNED|OOF_NUMBER|OOFW_IMM);
       break;
     case MEP_OPERAND_UDISP7 :
-      out_value(x, OOF_NUMBER|OOFW_IMM);
-      break;
     case MEP_OPERAND_UDISP7A2 :
-      out_value(x, OOF_NUMBER|OOFW_IMM);
-      break;
     case MEP_OPERAND_UDISP7A4 :
-      out_value(x, OOF_NUMBER|OOFW_IMM);
+      if (x.type == o_mem)
+      {
+        out_print_address(x, pc, x.n);
+      }
+      else
+      {
+        out_value(x, OOF_NUMBER|OOFW_IMM);
+      }
       break;
     case MEP_OPERAND_UIMM16 :
       if (x.type == o_imm)
@@ -721,6 +731,17 @@ case MEP_INSN_DSP:
     out_char(' ');
     out_one_operand(2);
     break;
+case MEP_INSN_DSP0:
+    out_mnem();
+    out_one_operand(0);
+    break;
+case MEP_INSN_DSP1:
+    out_mnem();
+    out_one_operand(0);
+    out_symbol(',');
+    out_char(' ');
+    out_one_operand(1);
+    break;
 case MEP_INSN_SB:
     out_mnem();
     out_one_operand(0);
@@ -800,7 +821,7 @@ case MEP_INSN_SW_SP:
     out_char(' ');
     out_one_operand(1);
     out_symbol('(');
-    cgen_outop(insn.Op3, MEP_OPERAND_SPR, insn.ea);
+    out_one_operand(2);
     out_symbol(')');
     break;
 case MEP_INSN_LW_SP:
@@ -810,7 +831,7 @@ case MEP_INSN_LW_SP:
     out_char(' ');
     out_one_operand(1);
     out_symbol('(');
-    cgen_outop(insn.Op3, MEP_OPERAND_SPR, insn.ea);
+    out_one_operand(2);
     out_symbol(')');
     break;
 case MEP_INSN_SB_TP:
@@ -820,7 +841,7 @@ case MEP_INSN_SB_TP:
     out_char(' ');
     out_one_operand(1);
     out_symbol('(');
-    cgen_outop(insn.Op3, MEP_OPERAND_TPR, insn.ea);
+    out_one_operand(2);
     out_symbol(')');
     break;
 case MEP_INSN_SH_TP:
@@ -830,7 +851,7 @@ case MEP_INSN_SH_TP:
     out_char(' ');
     out_one_operand(1);
     out_symbol('(');
-    cgen_outop(insn.Op3, MEP_OPERAND_TPR, insn.ea);
+    out_one_operand(2);
     out_symbol(')');
     break;
 case MEP_INSN_SW_TP:
@@ -840,7 +861,7 @@ case MEP_INSN_SW_TP:
     out_char(' ');
     out_one_operand(1);
     out_symbol('(');
-    cgen_outop(insn.Op3, MEP_OPERAND_TPR, insn.ea);
+    out_one_operand(2);
     out_symbol(')');
     break;
 case MEP_INSN_LB_TP:
@@ -850,7 +871,7 @@ case MEP_INSN_LB_TP:
     out_char(' ');
     out_one_operand(1);
     out_symbol('(');
-    cgen_outop(insn.Op3, MEP_OPERAND_TPR, insn.ea);
+    out_one_operand(2);
     out_symbol(')');
     break;
 case MEP_INSN_LH_TP:
@@ -860,7 +881,7 @@ case MEP_INSN_LH_TP:
     out_char(' ');
     out_one_operand(1);
     out_symbol('(');
-    cgen_outop(insn.Op3, MEP_OPERAND_TPR, insn.ea);
+    out_one_operand(2);
     out_symbol(')');
     break;
 case MEP_INSN_LW_TP:
@@ -870,7 +891,7 @@ case MEP_INSN_LW_TP:
     out_char(' ');
     out_one_operand(1);
     out_symbol('(');
-    cgen_outop(insn.Op3, MEP_OPERAND_TPR, insn.ea);
+    out_one_operand(2);
     out_symbol(')');
     break;
 case MEP_INSN_LBU_TP:
@@ -880,7 +901,7 @@ case MEP_INSN_LBU_TP:
     out_char(' ');
     out_one_operand(1);
     out_symbol('(');
-    cgen_outop(insn.Op3, MEP_OPERAND_TPR, insn.ea);
+    out_one_operand(2);
     out_symbol(')');
     break;
 case MEP_INSN_LHU_TP:
@@ -890,7 +911,7 @@ case MEP_INSN_LHU_TP:
     out_char(' ');
     out_one_operand(1);
     out_symbol('(');
-    cgen_outop(insn.Op3, MEP_OPERAND_TPR, insn.ea);
+    out_one_operand(2);
     out_symbol(')');
     break;
 case MEP_INSN_SB16:
@@ -1078,7 +1099,7 @@ case MEP_INSN_ADD3I:
     out_one_operand(0);
     out_symbol(',');
     out_char(' ');
-    cgen_outop(insn.Op2, MEP_OPERAND_SPR, insn.ea);
+    out_one_operand(1);
     out_symbol(',');
     out_char(' ');
     out_one_operand(2);
@@ -1450,27 +1471,21 @@ case MEP_INSN_STC_LP:
     out_one_operand(0);
     out_symbol(',');
     out_char(' ');
-    out_symbol('$');
-    out_symbol('l');
-    out_symbol('p');
+    out_one_operand(1);
     break;
 case MEP_INSN_STC_HI:
     out_mnem();
     out_one_operand(0);
     out_symbol(',');
     out_char(' ');
-    out_symbol('$');
-    out_symbol('h');
-    out_symbol('i');
+    out_one_operand(1);
     break;
 case MEP_INSN_STC_LO:
     out_mnem();
     out_one_operand(0);
     out_symbol(',');
     out_char(' ');
-    out_symbol('$');
-    out_symbol('l');
-    out_symbol('o');
+    out_one_operand(1);
     break;
 case MEP_INSN_STC:
     out_mnem();
@@ -1484,27 +1499,21 @@ case MEP_INSN_LDC_LP:
     out_one_operand(0);
     out_symbol(',');
     out_char(' ');
-    out_symbol('$');
-    out_symbol('l');
-    out_symbol('p');
+    out_one_operand(1);
     break;
 case MEP_INSN_LDC_HI:
     out_mnem();
     out_one_operand(0);
     out_symbol(',');
     out_char(' ');
-    out_symbol('$');
-    out_symbol('h');
-    out_symbol('i');
+    out_one_operand(1);
     break;
 case MEP_INSN_LDC_LO:
     out_mnem();
     out_one_operand(0);
     out_symbol(',');
     out_char(' ');
-    out_symbol('$');
-    out_symbol('l');
-    out_symbol('o');
+    out_one_operand(1);
     break;
 case MEP_INSN_LDC:
     out_mnem();
@@ -2316,6 +2325,18 @@ case MEP_INSN_RI_23:
     break;
 case MEP_INSN_RI_26:
     out_mnem();
+    break;
+case MEP_INSN_CMOV1:
+case MEP_INSN_CMOV2:
+case MEP_INSN_CMOVC1:
+case MEP_INSN_CMOVC2:
+case MEP_INSN_CMOVH1:
+case MEP_INSN_CMOVH2:
+    out_mnem();
+    out_one_operand(0);
+    out_symbol(',');
+    out_char(' ');
+    out_one_operand(1);
     break;
     default: break;
   }

@@ -1,4118 +1,1045 @@
-/* IDP emulator for mep.
+/* MEP IDP instructions emulator
 
-THIS FILE IS (mostly) MACHINE GENERATED WITH CGEN.
-
-Copyright (C) 2000-2010 Red Hat, Inc.
-
-This file is part of the Red Hat simulators.
-
-
+   Upgraded for IDA Pro 9.4 SDK and cross-referenced against the
+   Toshiba MeP-c4 Media Embedded Processor Architecture Specification
+   (DSAE0020861).
 */
 
-#pragma warning ( disable : 4146)
+#pragma warning ( disable : 4146 )
 #include "mep.hpp"
-unsigned long g_rptail = 0;
-unsigned long g_rpb = 0;
 
-static void make_stack_var(const insn_t &insn, const op_t &x)
+//----------------------------------------------------------------------
+// Resolve global base register symbols ($gp / $tp) if defined in the IDB
+static bool find_global_base_symbol(int reg, uval_t *p_val)
 {
-  if (may_create_stkvars())
+  if ( reg == MEP_REG_GP )
   {
-    adiff_t sp_off = x.value;
-    if ( insn_create_stkvar(insn, x, sp_off, 0) )
-      op_stkvar(insn.ea, x.n);
+    static const char *const gp_names[] = { "_gp", "__gp", "_sda_base_", "__sda_base" };
+    for ( size_t i = 0; i < qnumber(gp_names); ++i )
+    {
+      ea_t ea = get_name_ea(BADADDR, gp_names[i]);
+      if ( ea != BADADDR )
+      {
+        *p_val = (uint32)ea;
+        return true;
+      }
+    }
   }
-}
-
-static void add_sp(const insn_t &insn, sval_t delta)
-{
-  func_t *pfn = get_func(insn.ea);
-
-  if (may_trace_sp() && pfn)
+  else if ( reg == MEP_REG_TP )
   {
-    add_auto_stkpnt(pfn, insn.ea+insn.size, delta);
+    static const char *const tp_names[] = { "_tp", "__tp", "_tda_base_", "__tda_base" };
+    for ( size_t i = 0; i < qnumber(tp_names); ++i )
+    {
+      ea_t ea = get_name_ea(BADADDR, tp_names[i]);
+      if ( ea != BADADDR )
+      {
+        *p_val = (uint32)ea;
+        return true;
+      }
+    }
   }
+  return false;
 }
-/*
-*  Example Switch from AM32 module
-*
-.text:0000893C                 mvi     r3, 4
-.text:00008940                 addi    r4, r5, -1
-.text:00008944                 bgu     r4, r3, loc_8A50
-.text:00008948                 mvhi    r3, 1
-.text:0000894C                 sli     r4, r4, 2
-.text:00008950                 ori     r3, r3, low16(unk_18480)
-.text:00008954                 add     r3, r3, r4
-.text:00008958                 lw      r3, (r3+0)
-.text:0000895C                 b       r3
-*/
-/*
-ROM:80BD0C                 mov     $0, 4
-ROM:80BD0E                 mov     $6, $1
-ROM:80BD10                 sltu3   $0, $0, $3
-ROM:80BD12                 add3    $5, $1, 0x40
-ROM:80BD16                 bnei    $0, 0, loc_80BE90
-ROM:80BD1A                 sll     $3, 2
-ROM:80BD1C                 movu    $2, 0x2CB8
-ROM:80BD20                 add3    $3, $2, $3
-ROM:80BD22                 lw      $3, ($3)
-ROM:80BD24                 jmp     $3
-*/
 
-static size_t get_switch_entries(const insn_t& insn)
+//----------------------------------------------------------------------
+// Scan backwards within the current basic block / function to determine
+// the constant 32-bit value held in `reg` prior to executing `ea`.
+// If the value came directly from a `movh` instruction, `*p_movh_ea` is
+// set to the address of that `movh` instruction.
+bool mep_t::find_reg_value(ea_t ea, int reg, uval_t *p_val, ea_t *p_movh_ea, int max_steps)
 {
-    size_t entries = 0;
-    bool found = false;
-    insn_t prev;
-    ea_t prev_ea;
-    uint16 sll_reg = 0xFFFF, stlu3_reg = 0xFFFF;
-    prev_ea = decode_prev_insn(&prev, insn.ea);
-    for (int i = 0; i < 0x30; i++)
-    {
-        switch (prev.itype)
-        {
-        case MEP_INSN_SLLI:
-            if (prev.Op2.value == 2)
-            {
-                //msg("Found switch entires ssl at 0x%x\n", prev.ea);
-                sll_reg = prev.Op1.reg;
-            }
-            //check for shift left 2 and get reg
-            break;
-        case MEP_INSN_SLTU3:
-            if (prev.Op2.reg == sll_reg && sll_reg != 0xFFFF)
-            {
-                //msg("Found switch entires sltu3 at 0x%x\n", prev.ea);
-                stlu3_reg = prev.Op1.reg;
-                //entries = 1 + prev.Op3.value;
-                //found = true;
-            }
-            break;
-        case MEP_INSN_MOVI8:
-            if (prev.Op1.reg == stlu3_reg && stlu3_reg != 0xFFFF)
-            {
-                //msg("Found switch entires mov at 0x%x\n", prev.ea);
-                entries =  prev.Op2.value +1;
-                found = true;
+  if ( p_movh_ea != nullptr )
+    *p_movh_ea = BADADDR;
 
-            }
-            break;
-        default:
-            break;
-        }
-        if (found) break;
-        else prev_ea = decode_prev_insn(&prev, prev_ea);
-
-    }
-    //msg("Found 0x%x table entries\n", entries);
-    return entries;
-}
-static ea_t get_switch_table_addr(const insn_t& insn)
-{
-    ea_t table = BADADDR;
-    bool found = false;
-    insn_t prev;
-    ea_t prev_ea;
-    uint16 add_reg = 0xFFFF;
-    prev_ea = decode_prev_insn(&prev, insn.ea);
-    for (int i = 0; i < 0x30; i++)
-    {
-        switch (prev.itype)
-        {
-        case MEP_INSN_ADD3:
-            if ((prev.Op1.reg == prev.Op3.reg) && (prev.Op1.reg == insn.Op1.reg))
-            {
-                add_reg = prev.Op2.reg;
-            }
-
-            break;
-        case MEP_INSN_MOVU24:
-            if ((prev.Op1.reg == add_reg) && (add_reg != 0xFFFF))
-            {
-                table = prev.Op2.addr;
-                //msg("Found at address 0x%x jumptable value 0x%x\n", prev.ea, table);
-                found = true;
-            }
-            break;
-        case MEP_INSN_ADD3X:
-            if ((prev.Op1.reg == add_reg)  && (prev.Op2.reg == add_reg) && (add_reg != 0xFFFF))
-            {
-                table = prev.Op3.addr;
-                //msg("Found at address 0x%x jumptable value 0x%x\n", prev.ea, table);
-                found = true;
-            }
-            break;
-        default:
-            break;
-        }
-        if (found) break;
-        else prev_ea = decode_prev_insn(&prev, prev_ea);
-    }
-    //msg("jump table at 0x%x\n", table);
-    return table;
-}
-static ea_t get_switch_default_addr(const insn_t& insn)
-{
-    ea_t defjump = BADADDR, maybe = BADADDR;
-    //msg("In get_switch_default_addr\n");
-    bool found = false;
-    insn_t prev;
-    ea_t prev_ea;
-    uint16 sll_reg = 0xFFFF, bnei_reg = 0xFFFF;
-    prev_ea = decode_prev_insn(&prev, insn.ea);
-    for (int i = 0; i < 0x30; i++)
-    {
-        switch (prev.itype)
-        {
-        case MEP_INSN_SLLI:
-            if (prev.Op2.value == 2)
-            {
-                sll_reg = prev.Op1.reg;
-            }
-            //check for shift left 2 and get reg
-            break;
-        case MEP_INSN_BNEI:
-            maybe = prev.Op3.addr;
-            bnei_reg = prev.Op1.reg;
-            break;
-        case MEP_INSN_SLTU3:
-            if (prev.Op2.reg == sll_reg && sll_reg != 0xFFFF && bnei_reg == 1)
-            {
-                defjump = maybe;
-                found = true;
-                //entries = 1 + prev.Op3.value;
-                //found = true;
-            }
-            break;
-
-        default:
-            break;
-        }
-        if (found) break;
-        else prev_ea = decode_prev_insn(&prev, prev_ea);
-    }
-    //msg("defaddress = 0x%x\n", defjump);
-    return defjump;
-}
-bool mep_t::mep_is_switch(switch_info_t* si, const insn_t& insn) {
-    if (insn.Op1.type == o_reg && insn.Op1.reg < 12)
-    {
-        // Find the values needed to create the switch.
-        size_t num_entries;
-        ea_t jump_table_addr;
-        ea_t default_addr;
-
-        // if we find everything we need then set the values and return true so IDA creates the switch
-        num_entries = get_switch_entries(insn);
-        jump_table_addr = get_switch_table_addr(insn);
-        default_addr = get_switch_default_addr(insn);
-
-        if (num_entries > 1 && jump_table_addr != BADADDR && default_addr != BADADDR)
-        {
-
-            si->set_jtable_element_size(4);  // 4 bytes for 32-bit pointers in the table on MEP
-            si->set_jtable_size(num_entries);
-            si->startea = insn.ea;
-            si->jumps = jump_table_addr;
-            si->set_shift(0);  // No shift operation on the index
-            si->set_elbase(0);  // No base address for the jump table elements
-            si->defjump = default_addr;
-            si->regnum = insn.Op1.reg;
-
-            return true;
-        }
-    }
-
+  if ( reg == MEP_REG_SP || reg == MEP_REG_FP )
     return false;
 
-}
+  ea_t func_start = get_func_start(ea);
+  ea_t cur_ea = ea;
 
-// ********** x-invalid: --invalid--
-
-static int
-mep_emu_x_invalid (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
+  for ( int step = 0; step < max_steps && cur_ea != BADADDR; ++step )
   {
-    return 0;
-  }
-
-  return 0;
-}
-
-// ********** stcb_r: stcb $rn,($rma)
-
-static int
-mep_emu_stcb_r (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-
-  return 2;
-}
-
-// ********** ldcb_r: ldcb $rn,($rma)
-
-static int
-mep_emu_ldcb_r (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-[&](){ valid = 0; return 0; }();
-
-  return 2;
-}
-
-// ********** pref: pref $cimm4,($rma)
-
-static int
-mep_emu_pref (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-}
-
-  return 2;
-}
-
-// ********** prefd: pref $cimm4,$sdisp16($rma)
-
-static int
-mep_emu_prefd (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-}
-
-  return 4;
-}
-
-// ********** casb3: casb3 $rl5,$rn,($rm)
-
-static int
-mep_emu_casb3 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-[&](){ valid = 0; return 0; }();
-}
-
-  return 4;
-}
-
-// ********** cash3: cash3 $rl5,$rn,($rm)
-
-static int
-mep_emu_cash3 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-[&](){ valid = 0; return 0; }();
-}
-
-  return 4;
-}
-
-// ********** casw3: casw3 $rl5,$rn,($rm)
-
-static int
-mep_emu_casw3 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-[&](){ valid = 0; return 0; }();
-}
-
-  return 4;
-}
-
-// ********** sbcp: sbcp $crn,$cdisp12($rma)
-
-static int
-mep_emu_sbcp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ QI val = ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr)); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-}
-
-  return 4;
-}
-
-// ********** lbcp: lbcp $crn,$cdisp12($rma)
-
-static int
-mep_emu_lbcp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-EXTQISI ([&](){ QI val = ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr)); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-}
-
-  return 4;
-}
-
-// ********** lbucp: lbucp $crn,$cdisp12($rma)
-
-static int
-mep_emu_lbucp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-ZEXTQISI ([&](){ QI val = ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr)); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-}
-
-  return 4;
-}
-
-// ********** shcp: shcp $crn,$cdisp12($rma)
-
-static int
-mep_emu_shcp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ HI val = ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr)); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-}
-
-  return 4;
-}
-
-// ********** lhcp: lhcp $crn,$cdisp12($rma)
-
-static int
-mep_emu_lhcp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-EXTHISI ([&](){ HI val = ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr)); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-}
-
-  return 4;
-}
-
-// ********** lhucp: lhucp $crn,$cdisp12($rma)
-
-static int
-mep_emu_lhucp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-ZEXTHISI ([&](){ HI val = ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr)); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-}
-
-  return 4;
-}
-
-// ********** lbucpa: lbucpa $crn,($rma+),$cdisp10
-
-static int
-mep_emu_lbucpa (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-ZEXTQISI ([&](){ QI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-ADDSI ([&](){ valid = 0; return 0; }(), insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr);
-}
-
-  return 4;
-}
-
-// ********** lhucpa: lhucpa $crn,($rma+),$cdisp10a2
-
-static int
-mep_emu_lhucpa (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-ZEXTHISI ([&](){ HI val = ANDSI ([&](){ valid = 0; return 0; }(), INVSI (1)); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr));
-}
-
-  return 4;
-}
-
-// ********** lbucpm0: lbucpm0 $crn,($rma+),$cdisp10
-
-static int
-mep_emu_lbucpm0 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-ZEXTQISI ([&](){ QI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-[&](){   SI tmp_modulo_mask;
-  tmp_modulo_mask = [&](){   SI tmp_temp;
-  tmp_temp = ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-; return SRLSI (-1, [&](){ valid = 0; return 0; }()); }();
-; return [&](){ ORSI (ANDSI ([&](){ valid = 0; return 0; }(), INVSI (tmp_modulo_mask)), [&](){ valid = 0; return 0; }()); return ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr)); }(); }();
-}
-
-  return 4;
-}
-
-// ********** lhucpm0: lhucpm0 $crn,($rma+),$cdisp10a2
-
-static int
-mep_emu_lhucpm0 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-ZEXTHISI ([&](){ HI val = ANDSI ([&](){ valid = 0; return 0; }(), INVSI (1)); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-[&](){   SI tmp_modulo_mask;
-  tmp_modulo_mask = [&](){   SI tmp_temp;
-  tmp_temp = ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-; return SRLSI (-1, [&](){ valid = 0; return 0; }()); }();
-; return [&](){ ORSI (ANDSI ([&](){ valid = 0; return 0; }(), INVSI (tmp_modulo_mask)), [&](){ valid = 0; return 0; }()); return ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr)); }(); }();
-}
-
-  return 4;
-}
-
-// ********** lbucpm1: lbucpm1 $crn,($rma+),$cdisp10
-
-static int
-mep_emu_lbucpm1 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-ZEXTQISI ([&](){ QI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-[&](){   SI tmp_modulo_mask;
-  tmp_modulo_mask = [&](){   SI tmp_temp;
-  tmp_temp = ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-; return SRLSI (-1, [&](){ valid = 0; return 0; }()); }();
-; return [&](){ ORSI (ANDSI ([&](){ valid = 0; return 0; }(), INVSI (tmp_modulo_mask)), [&](){ valid = 0; return 0; }()); return ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr)); }(); }();
-}
-
-  return 4;
-}
-
-// ********** lhucpm1: lhucpm1 $crn,($rma+),$cdisp10a2
-
-static int
-mep_emu_lhucpm1 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-ZEXTHISI ([&](){ HI val = ANDSI ([&](){ valid = 0; return 0; }(), INVSI (1)); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-[&](){   SI tmp_modulo_mask;
-  tmp_modulo_mask = [&](){   SI tmp_temp;
-  tmp_temp = ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-; return SRLSI (-1, [&](){ valid = 0; return 0; }()); }();
-; return [&](){ ORSI (ANDSI ([&](){ valid = 0; return 0; }(), INVSI (tmp_modulo_mask)), [&](){ valid = 0; return 0; }()); return ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr)); }(); }();
-}
-
-  return 4;
-}
-
-// ********** uci: uci $rn,$rm,$uimm16
-
-static int
-mep_emu_uci (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-[&](){ valid = 0; return 0; }();
-
-  return 4;
-}
-
-// ********** dsp: dsp $rn,$rm,$uimm16
-
-static int
-mep_emu_dsp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-[&](){ valid = 0; return 0; }();
-
-  return 4;
-}
-
-// ********** sb: sb $rnc,($rma)
-
-static int
-mep_emu_sb (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ UQI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-}
-
-  return 2;
-}
-
-// ********** sh: sh $rns,($rma)
-
-static int
-mep_emu_sh (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ UHI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (1))); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-}
-
-  return 2;
-}
-
-// ********** sw: sw $rnl,($rma)
-
-static int
-mep_emu_sw (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (3))); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-}
-
-  return 2;
-}
-
-// ********** lb: lb $rnc,($rma)
-
-static int
-mep_emu_lb (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-EXTQISI ([&](){ QI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-
-  return 2;
-}
-
-// ********** lh: lh $rns,($rma)
-
-static int
-mep_emu_lh (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-EXTHISI ([&](){ HI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (1))); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-
-  return 2;
-}
-
-// ********** lw: lw $rnl,($rma)
-
-static int
-mep_emu_lw (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-[&](){ SI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (3))); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-;
-
-  return 2;
-}
-
-// ********** lbu: lbu $rnuc,($rma)
-
-static int
-mep_emu_lbu (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-ZEXTQISI ([&](){ UQI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-
-  return 2;
-}
-
-// ********** lhu: lhu $rnus,($rma)
-
-static int
-mep_emu_lhu (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-ZEXTHISI ([&](){ UHI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (1))); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-
-  return 2;
-}
-
-// ********** sw-sp: sw $rnl,$udisp7a4($spr)
-
-static int
-mep_emu_sw_sp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ SI val = ((((insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr) + ([&](){ valid = 0; return 0; }()))) & ((~ (3)))); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-}
-
-  make_stack_var(insn, insn.Op2);
-
-  return 2;
-}
-
-// ********** lw-sp: lw $rnl,$udisp7a4($spr)
-
-static int
-mep_emu_lw_sp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-[&](){ SI val = ((((insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr) + ([&](){ valid = 0; return 0; }()))) & ((~ (3)))); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-;
-  make_stack_var(insn, insn.Op2);
-
-  return 2;
-}
-
-// ********** sb-tp: sb $rn3c,$udisp7($tpr)
-
-static int
-mep_emu_sb_tp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ QI val = ADDSI (ZEXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr), [&](){ valid = 0; return 0; }()); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-}
-
-  return 2;
-}
-
-// ********** sh-tp: sh $rn3s,$udisp7a2($tpr)
-
-static int
-mep_emu_sh_tp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ HI val = ANDSI (ADDSI (ZEXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr), [&](){ valid = 0; return 0; }()), (~ (1))); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-}
-
-  return 2;
-}
-
-// ********** sw-tp: sw $rn3l,$udisp7a4($tpr)
-
-static int
-mep_emu_sw_tp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ SI val = ANDSI (ADDSI (ZEXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr), [&](){ valid = 0; return 0; }()), (~ (3))); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-}
-
-  return 2;
-}
-
-// ********** lb-tp: lb $rn3c,$udisp7($tpr)
-
-static int
-mep_emu_lb_tp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-EXTQISI ([&](){ QI val = ADDSI (ZEXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr), [&](){ valid = 0; return 0; }()); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-
-  return 2;
-}
-
-// ********** lh-tp: lh $rn3s,$udisp7a2($tpr)
-
-static int
-mep_emu_lh_tp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-EXTHISI ([&](){ HI val = ANDSI (ADDSI (ZEXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr), [&](){ valid = 0; return 0; }()), (~ (1))); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-
-  return 2;
-}
-
-// ********** lw-tp: lw $rn3l,$udisp7a4($tpr)
-
-static int
-mep_emu_lw_tp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-[&](){ SI val = ANDSI (ADDSI (ZEXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr), [&](){ valid = 0; return 0; }()), (~ (3))); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-;
-
-  return 2;
-}
-
-// ********** lbu-tp: lbu $rn3uc,$udisp7($tpr)
-
-static int
-mep_emu_lbu_tp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-ZEXTQISI ([&](){ QI val = ADDSI (ZEXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr), [&](){ valid = 0; return 0; }()); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-
-  return 2;
-}
-
-// ********** lhu-tp: lhu $rn3us,$udisp7a2($tpr)
-
-static int
-mep_emu_lhu_tp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-ZEXTHISI ([&](){ HI val = ANDSI (ADDSI (ZEXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr), [&](){ valid = 0; return 0; }()), (~ (1))); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-
-  return 2;
-}
-
-// ********** sb16: sb $rnc,$sdisp16($rma)
-
-static int
-mep_emu_sb16 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ QI val = ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr)); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-}
-
-  if (insn.Op3.reg == REGS_HW_H_GPR_BASE + 15)
-    make_stack_var(insn, insn.Op2);
-
-  return 4;
-}
-
-// ********** sh16: sh $rns,$sdisp16($rma)
-
-static int
-mep_emu_sh16 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ HI val = ANDSI (ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr)), (~ (1))); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-}
-  if (insn.Op3.reg == REGS_HW_H_GPR_BASE + 15)
-    make_stack_var(insn, insn.Op2);
-
-  return 4;
-}
-
-// ********** sw16: sw $rnl,$sdisp16($rma)
-
-static int
-mep_emu_sw16 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ SI val = ANDSI (ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr)), (~ (3))); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-}
-  if (insn.Op3.reg == REGS_HW_H_GPR_BASE + 15)
-    make_stack_var(insn, insn.Op2);
-
-  return 4;
-}
-
-// ********** lb16: lb $rnc,$sdisp16($rma)
-
-static int
-mep_emu_lb16 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-EXTQISI ([&](){ QI val = ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr)); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-  if (insn.Op3.reg == REGS_HW_H_GPR_BASE + 15)
-    make_stack_var(insn, insn.Op2);
-
-  return 4;
-}
-
-// ********** lh16: lh $rns,$sdisp16($rma)
-
-static int
-mep_emu_lh16 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-EXTHISI ([&](){ HI val = ANDSI (ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr)), (~ (1))); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-  if (insn.Op3.reg == REGS_HW_H_GPR_BASE + 15)
-    make_stack_var(insn, insn.Op2);
-
-  return 4;
-}
-
-// ********** lw16: lw $rnl,$sdisp16($rma)
-
-static int
-mep_emu_lw16 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-[&](){ SI val = ANDSI (ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr)), (~ (3))); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-;
-  if (insn.Op3.reg == REGS_HW_H_GPR_BASE + 15)
-    make_stack_var(insn, insn.Op2);
-
-  return 4;
-}
-
-// ********** lbu16: lbu $rnuc,$sdisp16($rma)
-
-static int
-mep_emu_lbu16 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-ZEXTQISI ([&](){ QI val = ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr)); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-  if (insn.Op3.reg == REGS_HW_H_GPR_BASE + 15)
-    make_stack_var(insn, insn.Op2);
-
-  return 4;
-}
-
-// ********** lhu16: lhu $rnus,$sdisp16($rma)
-
-static int
-mep_emu_lhu16 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-ZEXTHISI ([&](){ HI val = ANDSI (ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr)), (~ (1))); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-  if (insn.Op3.reg == REGS_HW_H_GPR_BASE + 15)
-    make_stack_var(insn, insn.Op2);
-
-  return 4;
-}
-
-// ********** sw24: sw $rnl,($addr24a4)
-
-static int
-mep_emu_sw24 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ SI val = ZEXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-}
-
-  return 4;
-}
-
-// ********** lw24: lw $rnl,($addr24a4)
-
-static int
-mep_emu_lw24 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-[&](){ SI val = ZEXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-;
-
-  return 4;
-}
-
-// ********** extb: extb $rn
-
-static int
-mep_emu_extb (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-EXTQISI (ANDQI ([&](){ valid = 0; return 0; }(), 255));
-
-  return 2;
-}
-
-// ********** exth: exth $rn
-
-static int
-mep_emu_exth (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-EXTHISI (ANDHI ([&](){ valid = 0; return 0; }(), 65535));
-
-  return 2;
-}
-
-// ********** extub: extub $rn
-
-static int
-mep_emu_extub (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-ZEXTSISI (ANDSI ([&](){ valid = 0; return 0; }(), 255));
-
-  return 2;
-}
-
-// ********** extuh: extuh $rn
-
-static int
-mep_emu_extuh (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-ZEXTSISI (ANDSI ([&](){ valid = 0; return 0; }(), 65535));
-
-  return 2;
-}
-
-// ********** ssarb: ssarb $udisp2($rm)
-
-static int
-mep_emu_ssarb (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-ZEXTSISI (((((((insn.Op1.type == o_imm ? insn.Op1.value : insn.Op1.addr) + ([&](){ valid = 0; return 0; }()))) & (3))) * (8)));
-((32) - (ZEXTSISI (((((((insn.Op1.type == o_imm ? insn.Op1.value : insn.Op1.addr) + ([&](){ valid = 0; return 0; }()))) & (3))) * (8)))));
-}
-
-  return 2;
-}
-
-// ********** mov: mov $rn,$rm
-
-static int
-mep_emu_mov (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-[&](){ valid = 0; return 0; }();
-
-  return 2;
-}
-
-// ********** movi8: mov $rn,$simm8
-
-static int
-mep_emu_movi8 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-EXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr);
-
-  return 2;
-}
-
-// ********** movi16: mov $rn,$simm16
-
-static int
-mep_emu_movi16 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-EXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr);
-
-  return 4;
-}
-
-// ********** movu24: movu $rn3,$uimm24
-
-static int
-mep_emu_movu24 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-  ea_t addr = ((SI)(USI)(insn.ops[1].type == o_imm ? insn.ops[1].value : insn.ops[1].addr));
-
-  if (segtype(addr) != SEG_UNDF) {
-    insn_add_dref(insn, addr, 0, dr_O);
-  }
-
-  return 4;
-}
-
-// ********** movu16: movu $rn,$uimm16
-
-static int
-mep_emu_movu16 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-ZEXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr);
-
-  return 4;
-}
-
-// ********** movh: movh $rn,$uimm16
-
-static int
-mep_emu_movh (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-((insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr) << (16));
-
-  return 4;
-}
-
-/*
-static int mep_emu_movh(const insn_t& insn)
-{
-    ea_t pc = insn.ea; // Effective address
-    int valid = 1;     // Validity flag
-
-    // Determine the value to shift based on insn.Op2.type and perform the shift
-    // Note: The shifted value is not being used or stored
-    if (insn.Op2.type == o_imm)
+    if ( func_start != BADADDR && cur_ea <= func_start )
+      break;
+
+    // Stop if cur_ea is the target of a non-fallthrough code reference
+    if ( step > 0 )
     {
-        // Perform the shift operation with insn.Op2.value, result is not stored
-        insn.Op2.value << 16;
-    }
-    else
-    {
-        // Perform the shift operation with insn.Op2.addr, result is not stored
-        insn.Op2.addr << 16;
+      xrefblk_t xb;
+      bool has_branch_in = false;
+      for ( bool ok = xb.first_to(cur_ea, XREF_FAR); ok; ok = xb.next_to() )
+      {
+        if ( xb.iscode )
+        {
+          has_branch_in = true;
+          break;
+        }
+      }
+      if ( has_branch_in )
+        break;
     }
 
-    return 4;
-}
-*/
-// ********** add3: add3 $rl,$rn,$rm
-
-static int
-mep_emu_add3 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-ADDSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-
-  return 2;
-}
-
-// ********** add: add $rn,$simm6
-
-static int
-mep_emu_add (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr));
-  if (insn.Op1.reg == REGS_HW_H_GPR_BASE + 15)
-    add_sp(insn, (sval_t)insn.Op2.value);
-
-  return 2;
-}
-
-// ********** add3i: add3 $rn,$spr,$uimm7a4
-
-static int
-mep_emu_add3i (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-ADDSI ([&](){ valid = 0; return 0; }(), ZEXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr));
-  if (insn.Op1.reg == REGS_HW_H_GPR_BASE + 15)
-    add_sp(insn, (sval_t)insn.Op3.value);
-
-  return 2;
-}
-
-// ********** advck3: advck3 \$0,$rn,$rm
-
-static int
-mep_emu_advck3 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-1;
-0;
-}
-
-  return 2;
-}
-
-// ********** sub: sub $rn,$rm
-
-static int
-mep_emu_sub (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-SUBSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-
-  return 2;
-}
-
-// ********** sbvck3: sbvck3 \$0,$rn,$rm
-
-static int
-mep_emu_sbvck3 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-1;
-0;
-}
-
-  return 2;
-}
-
-// ********** neg: neg $rn,$rm
-
-static int
-mep_emu_neg (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-NEGSI ([&](){ valid = 0; return 0; }());
-
-  return 2;
-}
-
-// ********** slt3: slt3 \$0,$rn,$rm
-
-static int
-mep_emu_slt3 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-1;
-0;
-}
-
-  return 2;
-}
-
-// ********** sltu3: sltu3 \$0,$rn,$rm
-
-static int
-mep_emu_sltu3 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-1;
-0;
-}
-
-  return 2;
-}
-
-// ********** slt3i: slt3 \$0,$rn,$uimm5
-
-static int
-mep_emu_slt3i (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-1;
-0;
-}
-
-  return 2;
-}
-
-// ********** sltu3i: sltu3 \$0,$rn,$uimm5
-
-static int
-mep_emu_sltu3i (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-1;
-0;
-}
-
-  return 2;
-}
-
-// ********** sl1ad3: sl1ad3 \$0,$rn,$rm
-
-static int
-mep_emu_sl1ad3 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-ADDSI (SLLSI ([&](){ valid = 0; return 0; }(), 1), [&](){ valid = 0; return 0; }());
-
-  return 2;
-}
-
-// ********** sl2ad3: sl2ad3 \$0,$rn,$rm
-
-static int
-mep_emu_sl2ad3 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-ADDSI (SLLSI ([&](){ valid = 0; return 0; }(), 2), [&](){ valid = 0; return 0; }());
-
-  return 2;
-}
-
-// ********** add3x: add3 $rn,$rm,$simm16
-
-static int
-mep_emu_add3x (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr));
-  if (insn.Op1.reg == REGS_HW_H_GPR_BASE + 15 && insn.Op2.reg == REGS_HW_H_GPR_BASE + 15)
-    add_sp(insn, (sval_t)insn.Op3.value);
-
-  return 4;
-}
-
-// ********** slt3x: slt3 $rn,$rm,$simm16
-
-static int
-mep_emu_slt3x (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-1;
-0;
-}
-
-  return 4;
-}
-
-// ********** sltu3x: sltu3 $rn,$rm,$uimm16
-
-static int
-mep_emu_sltu3x (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-1;
-0;
-}
-
-  return 4;
-}
-
-// ********** or: or $rn,$rm
-
-static int
-mep_emu_or (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-
-  return 2;
-}
-
-// ********** and: and $rn,$rm
-
-static int
-mep_emu_and (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-ANDSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-
-  return 2;
-}
-
-// ********** xor: xor $rn,$rm
-
-static int
-mep_emu_xor (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-XORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-
-  return 2;
-}
-
-// ********** nor: nor $rn,$rm
-
-static int
-mep_emu_nor (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-INVSI (ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }()));
-
-  return 2;
-}
-
-// ********** or3: or3 $rn,$rm,$uimm16
-
-static int
-mep_emu_or3 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-ORSI ([&](){ valid = 0; return 0; }(), ZEXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr));
-
-  return 4;
-}
-
-// ********** and3: and3 $rn,$rm,$uimm16
-
-static int
-mep_emu_and3 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-ANDSI ([&](){ valid = 0; return 0; }(), ZEXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr));
-
-  return 4;
-}
-
-// ********** xor3: xor3 $rn,$rm,$uimm16
-
-static int
-mep_emu_xor3 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-XORSI ([&](){ valid = 0; return 0; }(), ZEXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr));
-
-  return 4;
-}
-
-// ********** sra: sra $rn,$rm
-
-static int
-mep_emu_sra (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-SRASI ([&](){ valid = 0; return 0; }(), ANDSI ([&](){ valid = 0; return 0; }(), 31));
-
-  return 2;
-}
-
-// ********** srl: srl $rn,$rm
-
-static int
-mep_emu_srl (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-SRLSI ([&](){ valid = 0; return 0; }(), ANDSI ([&](){ valid = 0; return 0; }(), 31));
-
-  return 2;
-}
-
-// ********** sll: sll $rn,$rm
-
-static int
-mep_emu_sll (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-SLLSI ([&](){ valid = 0; return 0; }(), ANDSI ([&](){ valid = 0; return 0; }(), 31));
-
-  return 2;
-}
-
-// ********** srai: sra $rn,$uimm5
-
-static int
-mep_emu_srai (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-SRASI ([&](){ valid = 0; return 0; }(), insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr);
-
-  return 2;
-}
-
-// ********** srli: srl $rn,$uimm5
-
-static int
-mep_emu_srli (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-SRLSI ([&](){ valid = 0; return 0; }(), insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr);
-
-  return 2;
-}
-
-// ********** slli: sll $rn,$uimm5
-
-static int
-mep_emu_slli (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-SLLSI ([&](){ valid = 0; return 0; }(), insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr);
-
-  return 2;
-}
-
-// ********** sll3: sll3 \$0,$rn,$uimm5
-
-static int
-mep_emu_sll3 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-SLLSI ([&](){ valid = 0; return 0; }(), insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr);
-
-  return 2;
-}
-
-// ********** fsft: fsft $rn,$rm
-
-static int
-mep_emu_fsft (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-  DI tmp_temp;
-  QI tmp_shamt;
-  tmp_shamt = ANDSI ([&](){ valid = 0; return 0; }(), 63);
-  tmp_temp = SLLDI (ORDI (SLLDI (ZEXTSIDI ([&](){ valid = 0; return 0; }()), 32), ZEXTSIDI ([&](){ valid = 0; return 0; }())), tmp_shamt);
-SUBWORDDISI (SRLDI (tmp_temp, 32), 1);
-}
-
-  return 2;
-}
-
-// ********** bra: bra $pcrel12a2
-
-static int
-mep_emu_bra (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = ((insn.Op1.type == o_imm ? insn.Op1.value : insn.Op1.addr) & ((~ (1)))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** beqz: beqz $rn,$pcrel8a2
-
-static int
-mep_emu_beqz (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ USI val = ((insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr) & ((~ (1)))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-
-  return 2;
-}
-
-// ********** bnez: bnez $rn,$pcrel8a2
-
-static int
-mep_emu_bnez (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ USI val = ((insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr) & ((~ (1)))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-
-  return 2;
-}
-
-// ********** beqi: beqi $rn,$uimm4,$pcrel17a2
-
-static int
-mep_emu_beqi (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ USI val = ((insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr) & ((~ (1)))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-
-  return 4;
-}
-
-// ********** bnei: bnei $rn,$uimm4,$pcrel17a2
-
-static int
-mep_emu_bnei (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ USI val = ((insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr) & ((~ (1)))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-
-  return 4;
-}
-
-// ********** blti: blti $rn,$uimm4,$pcrel17a2
-
-static int
-mep_emu_blti (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ USI val = ((insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr) & ((~ (1)))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-
-  return 4;
-}
-
-// ********** bgei: bgei $rn,$uimm4,$pcrel17a2
-
-static int
-mep_emu_bgei (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ USI val = ((insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr) & ((~ (1)))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-
-  return 4;
-}
-
-// ********** beq: beq $rn,$rm,$pcrel17a2
-
-static int
-mep_emu_beq (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ USI val = ((insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr) & ((~ (1)))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-
-  return 4;
-}
-
-// ********** bne: bne $rn,$rm,$pcrel17a2
-
-static int
-mep_emu_bne (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ USI val = ((insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr) & ((~ (1)))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-
-  return 4;
-}
-
-// ********** bsr12: bsr $pcrel12a2
-
-static int
-mep_emu_bsr12 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-ADDSI (pc, 2);
-{ USI val = ((insn.Op1.type == o_imm ? insn.Op1.value : insn.Op1.addr) & ((~ (1)))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-
-  return 2;
-}
-
-// ********** bsr24: bsr $pcrel24a2
-
-static int
-mep_emu_bsr24 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-ADDSI (pc, 4);
-{ USI val = ((insn.Op1.type == o_imm ? insn.Op1.value : insn.Op1.addr) & ((~ (1)))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-
-  return 4;
-}
-
-// ********** jmp: jmp $rm
-
-static int
-mep_emu_jmp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{
-{
-{
-ORSI (ANDSI ([&](){ valid = 0; return 0; }(), (~ (((1) << (12))))), ((((1) << (12))) & (((1) << (12)))));
-{
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (3))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (7))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-}
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (1))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-{
-{
-ORSI (ANDSI ([&](){ valid = 0; return 0; }(), (~ (((1) << (12))))), ((((1) << (12))) & (((0) << (12)))));
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (1))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-{
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (3))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (7))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-}
-}
-}
-
-  return 2;
-}
-
-// ********** jmp24: jmp $pcabs24a2
-
-static int
-mep_emu_jmp24 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ USI val = ANDSI (ORSI (ANDSI (pc, 0xf0000000), insn.Op1.type == o_imm ? insn.Op1.value : insn.Op1.addr), (~ (1))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-
-  return 4;
-}
-
-// ********** jsr: jsr $rm
-
-static int
-mep_emu_jsr (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-ADDSI (pc, 2);
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (1))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-
-  return 2;
-}
-
-// ********** ret: ret
-
-static int
-mep_emu_ret (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{
-{
-{
-ORSI (ANDSI ([&](){ valid = 0; return 0; }(), (~ (((1) << (12))))), ((((1) << (12))) & (((1) << (12)))));
-{
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (3))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (7))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-}
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (1))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-{
-{
-ORSI (ANDSI ([&](){ valid = 0; return 0; }(), (~ (((1) << (12))))), ((((1) << (12))) & (((0) << (12)))));
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (1))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-{
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (3))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (7))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-}
-}
-}
-
-  return 2;
-}
-
-// ********** repeat: repeat $rn,$pcrel17a2
-
-static int
-mep_emu_repeat (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  insn_t rpb_insn, rpe_insn,tail_insn;
-  int len;
-  ea_t rpb, rpe;
-  rpb = pc + insn.size;
-  rpe = insn.Op2.addr; // Address of the end of the loop block sort of, the real end is the next instruction after the address specified here
-  len = decode_insn(&rpb_insn, rpb);
-  if (len <= 0) return 4;
-  len = decode_insn(&rpe_insn, rpe);
-  if (len <= 0) return 4;
-  len = decode_insn(&tail_insn, rpe + len);
-  if (len <= 0) return 4;
-
-  //msg("creating cref at 0x%x to 0x%x\n", tail_insn.ea, insn.ea);
-  //tail_insn.add_cref(rpb, 0, fl_JN);
-  //insn_add_cref(insn, tail_insn.ea, 0, fl_JN);
-  g_rptail = tail_insn.ea;
-  g_rpb = rpb_insn.ea;
-  return 4;
-}
-
-// ********** erepeat: erepeat $pcrel17a2
-
-static int
-mep_emu_erepeat (const insn_t &insn)
-{
-    ea_t pc = insn.ea;
-    insn_t rpb_insn, rpe_insn, tail_insn;
-    int len;
-    ea_t rpb, rpe;
-    rpb = pc + insn.size;
-    rpe = insn.Op1.addr; // Address of the end of the loop block sort of, the real end is the next instruction after the address specified here
-    //msg("target address = 0x%x\n", rpe);
-    len = decode_insn(&rpb_insn, rpb);
-    if (len <= 0) return 4;
-    len = decode_insn(&rpe_insn, rpe);
-    if (len <= 0) return 4;
-    len = decode_insn(&tail_insn, rpe + len);
-    if (len <= 0) return 4;
-    //msg("creating cref at 0x%x to 0x%x\n", tail_insn.ea, insn.ea);
-    //tail_insn.add_cref(rpb, 0, fl_JN);
-    g_rptail = tail_insn.ea;
-    g_rpb = rpb_insn.ea;
-    //msg("creating cref at 0x%x to 0x%x\n", insn.ea, tail_insn.ea);
-    //insn_add_cref(insn, tail_insn.ea, 0, fl_JN);
-            
-
-    
-
-    return 4;
-}
-
-// ********** stc_lp: stc $rn,\$lp
-
-static int
-mep_emu_stc_lp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-[&](){ valid = 0; return 0; }();
-
-  return 2;
-}
-
-// ********** stc_hi: stc $rn,\$hi
-
-static int
-mep_emu_stc_hi (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-[&](){ valid = 0; return 0; }();
-
-  return 2;
-}
-
-// ********** stc_lo: stc $rn,\$lo
-
-static int
-mep_emu_stc_lo (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-[&](){ valid = 0; return 0; }();
-
-  return 2;
-}
-
-// ********** stc: stc $rn,$csrn
-
-static int
-mep_emu_stc (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-[&](){ valid = 0; return 0; }();
-
-  return 2;
-}
-
-// ********** ldc_lp: ldc $rn,\$lp
-
-static int
-mep_emu_ldc_lp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-[&](){ valid = 0; return 0; }();
-
-  return 2;
-}
-
-// ********** ldc_hi: ldc $rn,\$hi
-
-static int
-mep_emu_ldc_hi (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-[&](){ valid = 0; return 0; }();
-
-  return 2;
-}
-
-// ********** ldc_lo: ldc $rn,\$lo
-
-static int
-mep_emu_ldc_lo (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-[&](){ valid = 0; return 0; }();
-
-  return 2;
-}
-
-// ********** ldc: ldc $rn,$csrn
-
-static int
-mep_emu_ldc (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-ADDSI (pc, 2);
-[&](){ valid = 0; return 0; }();
-}
-
-  return 2;
-}
-
-// ********** di: di
-
-static int
-mep_emu_di (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-SLLSI (SRLSI ([&](){ valid = 0; return 0; }(), 1), 1);
-
-  return 2;
-}
-
-// ********** ei: ei
-
-static int
-mep_emu_ei (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-ORSI ([&](){ valid = 0; return 0; }(), 1);
-
-  return 2;
-}
-
-// ********** reti: reti
-
-static int
-mep_emu_reti (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{
-{
-{
-ORSI (ANDSI ([&](){ valid = 0; return 0; }(), (~ (((1) << (12))))), ((((1) << (12))) & (((1) << (12)))));
-{
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (3))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (7))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-ORSI (ANDSI ([&](){ valid = 0; return 0; }(), (~ (((1) << (9))))), ((((1) << (9))) & (((0) << (9)))));
-}
-{
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (1))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-ORSI (ANDSI ([&](){ valid = 0; return 0; }(), (~ (((1) << (9))))), ((((1) << (9))) & (((0) << (9)))));
-}
-}
-{
-{
-ORSI (ANDSI ([&](){ valid = 0; return 0; }(), (~ (((1) << (12))))), ((((1) << (12))) & (((1) << (12)))));
-{
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (3))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (7))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-ORSI (ANDSI ([&](){ valid = 0; return 0; }(), (~ (((1) << (2))))), ((((1) << (2))) & (SLLSI (ANDSI (SRLSI ([&](){ valid = 0; return 0; }(), 3), 1), 2))));
-ORSI (ANDSI ([&](){ valid = 0; return 0; }(), (~ (((1) << (0))))), ((((1) << (0))) & (SLLSI (ANDSI (SRLSI ([&](){ valid = 0; return 0; }(), 1), 1), 0))));
-}
-{
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (1))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-ORSI (ANDSI ([&](){ valid = 0; return 0; }(), (~ (((1) << (2))))), ((((1) << (2))) & (SLLSI (ANDSI (SRLSI ([&](){ valid = 0; return 0; }(), 3), 1), 2))));
-ORSI (ANDSI ([&](){ valid = 0; return 0; }(), (~ (((1) << (0))))), ((((1) << (0))) & (SLLSI (ANDSI (SRLSI ([&](){ valid = 0; return 0; }(), 1), 1), 0))));
-}
-}
-}
-((void) 0); /*nop*/
-}
-
-  return 2;
-}
-
-// ********** halt: halt
-
-static int
-mep_emu_halt (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-ORSI ([&](){ valid = 0; return 0; }(), ((1) << (11)));
-
-  return 2;
-}
-
-// ********** sleep: sleep
-
-static int
-mep_emu_sleep (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-
-  return 2;
-}
-
-// ********** swi: swi $uimm2
-
-static int
-mep_emu_swi (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-ORSI ([&](){ valid = 0; return 0; }(), ((1) << (4)));
-ORSI ([&](){ valid = 0; return 0; }(), ((1) << (5)));
-ORSI ([&](){ valid = 0; return 0; }(), ((1) << (6)));
-ORSI ([&](){ valid = 0; return 0; }(), ((1) << (7)));
-}
-
-  return 2;
-}
-
-// ********** break: break
-
-static int
-mep_emu_break (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** syncm: syncm
-
-static int
-mep_emu_syncm (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-((void) 0); /*nop*/
-
-  return 2;
-}
-
-// ********** stcb: stcb $rn,$uimm16
-
-static int
-mep_emu_stcb (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-
-  return 4;
-}
-
-// ********** ldcb: ldcb $rn,$uimm16
-
-static int
-mep_emu_ldcb (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-[&](){ valid = 0; return 0; }();
-
-  return 4;
-}
-
-// ********** bsetm: bsetm ($rma),$uimm3
-
-static int
-mep_emu_bsetm (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ UQI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-}
-
-  return 2;
-}
-
-// ********** bclrm: bclrm ($rma),$uimm3
-
-static int
-mep_emu_bclrm (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ UQI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-}
-
-  return 2;
-}
-
-// ********** bnotm: bnotm ($rma),$uimm3
-
-static int
-mep_emu_bnotm (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ UQI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-}
-
-  return 2;
-}
-
-// ********** btstm: btstm \$0,($rma),$uimm3
-
-static int
-mep_emu_btstm (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-ZEXTQISI (ANDQI ([&](){ UQI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-, ((1) << (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr))));
-}
-
-  return 2;
-}
-
-// ********** tas: tas $rn,($rma)
-
-static int
-mep_emu_tas (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-  SI tmp_result;
-  tmp_result = ZEXTQISI ([&](){ UQI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-{ UQI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-tmp_result;
-}
-
-  return 2;
-}
-
-// ********** cache: cache $cimm4,($rma)
-
-static int
-mep_emu_cache (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-
-  return 2;
-}
-
-// ********** mul: mul $rn,$rm
-
-static int
-mep_emu_mul (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-  DI tmp_result;
-  tmp_result = MULDI (EXTSIDI ([&](){ valid = 0; return 0; }()), EXTSIDI ([&](){ valid = 0; return 0; }()));
-SUBWORDDISI (tmp_result, 0);
-SUBWORDDISI (tmp_result, 1);
-}
-
-  return 2;
-}
-
-// ********** mulu: mulu $rn,$rm
-
-static int
-mep_emu_mulu (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-  DI tmp_result;
-  tmp_result = MULDI (ZEXTSIDI ([&](){ valid = 0; return 0; }()), ZEXTSIDI ([&](){ valid = 0; return 0; }()));
-SUBWORDDISI (tmp_result, 0);
-SUBWORDDISI (tmp_result, 1);
-}
-
-  return 2;
-}
-
-// ********** mulr: mulr $rn,$rm
-
-static int
-mep_emu_mulr (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-  DI tmp_result;
-  tmp_result = MULDI (EXTSIDI ([&](){ valid = 0; return 0; }()), EXTSIDI ([&](){ valid = 0; return 0; }()));
-SUBWORDDISI (tmp_result, 0);
-SUBWORDDISI (tmp_result, 1);
-SUBWORDDISI (tmp_result, 1);
-}
-
-  return 2;
-}
-
-// ********** mulru: mulru $rn,$rm
-
-static int
-mep_emu_mulru (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-  DI tmp_result;
-  tmp_result = MULDI (ZEXTSIDI ([&](){ valid = 0; return 0; }()), ZEXTSIDI ([&](){ valid = 0; return 0; }()));
-SUBWORDDISI (tmp_result, 0);
-SUBWORDDISI (tmp_result, 1);
-SUBWORDDISI (tmp_result, 1);
-}
-
-  return 2;
-}
-
-// ********** madd: madd $rn,$rm
-
-static int
-mep_emu_madd (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-  DI tmp_result;
-  tmp_result = ORDI (SLLDI (ZEXTSIDI ([&](){ valid = 0; return 0; }()), 32), ZEXTSIDI ([&](){ valid = 0; return 0; }()));
-  tmp_result = ADDDI (tmp_result, MULDI (EXTSIDI ([&](){ valid = 0; return 0; }()), EXTSIDI ([&](){ valid = 0; return 0; }())));
-SUBWORDDISI (tmp_result, 0);
-SUBWORDDISI (tmp_result, 1);
-}
-
-  return 4;
-}
-
-// ********** maddu: maddu $rn,$rm
-
-static int
-mep_emu_maddu (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-  DI tmp_result;
-  tmp_result = ORDI (SLLDI (ZEXTSIDI ([&](){ valid = 0; return 0; }()), 32), ZEXTSIDI ([&](){ valid = 0; return 0; }()));
-  tmp_result = ADDDI (tmp_result, MULDI (ZEXTSIDI ([&](){ valid = 0; return 0; }()), ZEXTSIDI ([&](){ valid = 0; return 0; }())));
-SUBWORDDISI (tmp_result, 0);
-SUBWORDDISI (tmp_result, 1);
-}
-
-  return 4;
-}
-
-// ********** maddr: maddr $rn,$rm
-
-static int
-mep_emu_maddr (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-  DI tmp_result;
-  tmp_result = ORDI (SLLDI (ZEXTSIDI ([&](){ valid = 0; return 0; }()), 32), ZEXTSIDI ([&](){ valid = 0; return 0; }()));
-  tmp_result = ADDDI (tmp_result, MULDI (EXTSIDI ([&](){ valid = 0; return 0; }()), EXTSIDI ([&](){ valid = 0; return 0; }())));
-SUBWORDDISI (tmp_result, 0);
-SUBWORDDISI (tmp_result, 1);
-SUBWORDDISI (tmp_result, 1);
-}
-
-  return 4;
-}
-
-// ********** maddru: maddru $rn,$rm
-
-static int
-mep_emu_maddru (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-  DI tmp_result;
-  tmp_result = ORDI (SLLDI (ZEXTSIDI ([&](){ valid = 0; return 0; }()), 32), ZEXTSIDI ([&](){ valid = 0; return 0; }()));
-  tmp_result = ADDDI (tmp_result, MULDI (ZEXTSIDI ([&](){ valid = 0; return 0; }()), ZEXTSIDI ([&](){ valid = 0; return 0; }())));
-SUBWORDDISI (tmp_result, 0);
-SUBWORDDISI (tmp_result, 1);
-SUBWORDDISI (tmp_result, 1);
-}
-
-  return 4;
-}
-
-// ********** div: div $rn,$rm
-
-static int
-mep_emu_div (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-{
-{
-0x80000000;
-0;
-}
-{
-DIVSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-MODSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-}
-}
-}
-}
-
-  return 2;
-}
-
-// ********** divu: divu $rn,$rm
-
-static int
-mep_emu_divu (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-{
-UDIVSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-UMODSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-}
-}
-}
-
-  return 2;
-}
-
-// ********** dret: dret
-
-static int
-mep_emu_dret (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-ANDSI ([&](){ valid = 0; return 0; }(), INVSI (SLLSI (1, 15)));
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-
-  return 2;
-}
-
-// ********** dbreak: dbreak
-
-static int
-mep_emu_dbreak (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-ORSI ([&](){ valid = 0; return 0; }(), 1);
-}
-
-  return 2;
-}
-
-// ********** ldz: ldz $rn,$rm
-
-static int
-mep_emu_ldz (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-[&](){ valid = 0; return 0; }();
-}
-
-  return 4;
-}
-
-// ********** abs: abs $rn,$rm
-
-static int
-mep_emu_abs (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-ABSSI (SUBSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }()));
-}
-
-  return 4;
-}
-
-// ********** ave: ave $rn,$rm
-
-static int
-mep_emu_ave (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-SRASI (ADDSI (ADDSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }()), 1), 1);
-}
-
-  return 4;
-}
-
-// ********** min: min $rn,$rm
-
-static int
-mep_emu_min (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{
-[&](){ valid = 0; return 0; }();
-}
-}
-
-  return 4;
-}
-
-// ********** max: max $rn,$rm
-
-static int
-mep_emu_max (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{
-[&](){ valid = 0; return 0; }();
-}
-}
-
-  return 4;
-}
-
-// ********** minu: minu $rn,$rm
-
-static int
-mep_emu_minu (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{
-[&](){ valid = 0; return 0; }();
-}
-}
-
-  return 4;
-}
-
-// ********** maxu: maxu $rn,$rm
-
-static int
-mep_emu_maxu (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{
-[&](){ valid = 0; return 0; }();
-}
-}
-
-  return 4;
-}
-
-// ********** clip: clip $rn,$cimm5
-
-static int
-mep_emu_clip (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-  SI tmp_min;
-  SI tmp_max;
-  tmp_max = ((((1) << (((insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr) - (1))))) - (1));
-  tmp_min = (- (((1) << (((insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr) - (1))))));
-{
-0;
-tmp_max;
-tmp_min;
-}
-}
-
-  return 4;
-}
-
-// ********** clipu: clipu $rn,$cimm5
-
-static int
-mep_emu_clipu (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-  SI tmp_max;
-  tmp_max = ((((1) << (insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr))) - (1));
-{
-0;
-tmp_max;
-0;
-}
-}
-
-  return 4;
-}
-
-// ********** sadd: sadd $rn,$rm
-
-static int
-mep_emu_sadd (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{
-{
-(- (((1) << (31))));
-((((1) << (31))) - (1));
-}
-ADDSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-}
-}
-
-  return 4;
-}
-
-// ********** ssub: ssub $rn,$rm
-
-static int
-mep_emu_ssub (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{
-{
-(- (((1) << (31))));
-((((1) << (31))) - (1));
-}
-SUBSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-}
-}
-
-  return 4;
-}
-
-// ********** saddu: saddu $rn,$rm
-
-static int
-mep_emu_saddu (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{
-(~ (0));
-ADDSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-}
-}
-
-  return 4;
-}
-
-// ********** ssubu: ssubu $rn,$rm
-
-static int
-mep_emu_ssubu (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{
-0;
-SUBSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-}
-}
-
-  return 4;
-}
-
-// ********** swcp: swcp $crn,($rma)
-
-static int
-mep_emu_swcp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ SI val = ANDSI ([&](){ valid = 0; return 0; }(), INVSI (3)); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-}
-
-  return 2;
-}
-
-// ********** lwcp: lwcp $crn,($rma)
-
-static int
-mep_emu_lwcp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-[&](){ SI val = ANDSI ([&](){ valid = 0; return 0; }(), INVSI (3)); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-;
-}
-
-  return 2;
-}
-
-// ********** smcp: smcp $crn64,($rma)
-
-static int
-mep_emu_smcp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-}
-
-  return 2;
-}
-
-// ********** lmcp: lmcp $crn64,($rma)
-
-static int
-mep_emu_lmcp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-[&](){ valid = 0; return 0; }();
-}
-
-  return 2;
-}
-
-// ********** swcpi: swcpi $crn,($rma+)
-
-static int
-mep_emu_swcpi (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ SI val = ANDSI ([&](){ valid = 0; return 0; }(), INVSI (3)); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-ADDSI ([&](){ valid = 0; return 0; }(), 4);
-}
-
-  return 2;
-}
-
-// ********** lwcpi: lwcpi $crn,($rma+)
-
-static int
-mep_emu_lwcpi (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-[&](){ SI val = ANDSI ([&](){ valid = 0; return 0; }(), INVSI (3)); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-;
-ADDSI ([&](){ valid = 0; return 0; }(), 4);
-}
-
-  return 2;
-}
-
-// ********** smcpi: smcpi $crn64,($rma+)
-
-static int
-mep_emu_smcpi (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-[&](){ valid = 0; return 0; }();
-}
-
-  return 2;
-}
-
-// ********** lmcpi: lmcpi $crn64,($rma+)
-
-static int
-mep_emu_lmcpi (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-[&](){ valid = 0; return 0; }();
-[&](){ valid = 0; return 0; }();
-}
-
-  return 2;
-}
-
-// ********** swcp16: swcp $crn,$sdisp16($rma)
-
-static int
-mep_emu_swcp16 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ SI val = ANDSI (ADDSI ([&](){ valid = 0; return 0; }(), insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr), INVSI (3)); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-}
-
-  return 4;
-}
-
-// ********** lwcp16: lwcp $crn,$sdisp16($rma)
-
-static int
-mep_emu_lwcp16 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-[&](){ SI val = ANDSI (ADDSI ([&](){ valid = 0; return 0; }(), insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr), INVSI (3)); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-;
-}
-
-  return 4;
-}
-
-// ********** smcp16: smcp $crn64,$sdisp16($rma)
-
-static int
-mep_emu_smcp16 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-}
-
-  return 4;
-}
-
-// ********** lmcp16: lmcp $crn64,$sdisp16($rma)
-
-static int
-mep_emu_lmcp16 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-[&](){ valid = 0; return 0; }();
-}
-
-  return 4;
-}
-
-// ********** sbcpa: sbcpa $crn,($rma+),$cdisp10
-
-static int
-mep_emu_sbcpa (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ QI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr));
-}
-
-  return 4;
-}
-
-// ********** lbcpa: lbcpa $crn,($rma+),$cdisp10
-
-static int
-mep_emu_lbcpa (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-EXTQISI ([&](){ QI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr));
-}
-
-  return 4;
-}
-
-// ********** shcpa: shcpa $crn,($rma+),$cdisp10a2
-
-static int
-mep_emu_shcpa (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ HI val = ANDSI ([&](){ valid = 0; return 0; }(), INVSI (1)); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr));
-}
-
-  return 4;
-}
-
-// ********** lhcpa: lhcpa $crn,($rma+),$cdisp10a2
-
-static int
-mep_emu_lhcpa (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-EXTHISI ([&](){ HI val = ANDSI ([&](){ valid = 0; return 0; }(), INVSI (1)); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr));
-}
-
-  return 4;
-}
-
-// ********** swcpa: swcpa $crn,($rma+),$cdisp10a4
-
-static int
-mep_emu_swcpa (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ SI val = ANDSI ([&](){ valid = 0; return 0; }(), INVSI (3)); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr));
-}
-
-  return 4;
-}
-
-// ********** lwcpa: lwcpa $crn,($rma+),$cdisp10a4
-
-static int
-mep_emu_lwcpa (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-[&](){ SI val = ANDSI ([&](){ valid = 0; return 0; }(), INVSI (3)); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-;
-ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr));
-}
-
-  return 4;
-}
-
-// ********** smcpa: smcpa $crn64,($rma+),$cdisp10a8
-
-static int
-mep_emu_smcpa (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-[&](){ valid = 0; return 0; }();
-}
-
-  return 4;
-}
-
-// ********** lmcpa: lmcpa $crn64,($rma+),$cdisp10a8
-
-static int
-mep_emu_lmcpa (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-[&](){ valid = 0; return 0; }();
-[&](){ valid = 0; return 0; }();
-}
-
-  return 4;
-}
-
-// ********** sbcpm0: sbcpm0 $crn,($rma+),$cdisp10
-
-static int
-mep_emu_sbcpm0 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ QI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-[&](){   SI tmp_modulo_mask;
-  tmp_modulo_mask = [&](){   SI tmp_temp;
-  tmp_temp = ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-; return SRLSI (-1, [&](){ valid = 0; return 0; }()); }();
-; return [&](){ ORSI (ANDSI ([&](){ valid = 0; return 0; }(), INVSI (tmp_modulo_mask)), [&](){ valid = 0; return 0; }()); return ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr)); }(); }();
-}
-
-  return 4;
-}
-
-// ********** lbcpm0: lbcpm0 $crn,($rma+),$cdisp10
-
-static int
-mep_emu_lbcpm0 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-EXTQISI ([&](){ QI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-[&](){   SI tmp_modulo_mask;
-  tmp_modulo_mask = [&](){   SI tmp_temp;
-  tmp_temp = ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-; return SRLSI (-1, [&](){ valid = 0; return 0; }()); }();
-; return [&](){ ORSI (ANDSI ([&](){ valid = 0; return 0; }(), INVSI (tmp_modulo_mask)), [&](){ valid = 0; return 0; }()); return ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr)); }(); }();
-}
-
-  return 4;
-}
-
-// ********** shcpm0: shcpm0 $crn,($rma+),$cdisp10a2
-
-static int
-mep_emu_shcpm0 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ HI val = ANDSI ([&](){ valid = 0; return 0; }(), INVSI (1)); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-[&](){   SI tmp_modulo_mask;
-  tmp_modulo_mask = [&](){   SI tmp_temp;
-  tmp_temp = ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-; return SRLSI (-1, [&](){ valid = 0; return 0; }()); }();
-; return [&](){ ORSI (ANDSI ([&](){ valid = 0; return 0; }(), INVSI (tmp_modulo_mask)), [&](){ valid = 0; return 0; }()); return ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr)); }(); }();
-}
-
-  return 4;
-}
-
-// ********** lhcpm0: lhcpm0 $crn,($rma+),$cdisp10a2
-
-static int
-mep_emu_lhcpm0 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-EXTHISI ([&](){ HI val = ANDSI ([&](){ valid = 0; return 0; }(), INVSI (1)); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-[&](){   SI tmp_modulo_mask;
-  tmp_modulo_mask = [&](){   SI tmp_temp;
-  tmp_temp = ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-; return SRLSI (-1, [&](){ valid = 0; return 0; }()); }();
-; return [&](){ ORSI (ANDSI ([&](){ valid = 0; return 0; }(), INVSI (tmp_modulo_mask)), [&](){ valid = 0; return 0; }()); return ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr)); }(); }();
-}
-
-  return 4;
-}
-
-// ********** swcpm0: swcpm0 $crn,($rma+),$cdisp10a4
-
-static int
-mep_emu_swcpm0 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ SI val = ANDSI ([&](){ valid = 0; return 0; }(), INVSI (3)); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-[&](){   SI tmp_modulo_mask;
-  tmp_modulo_mask = [&](){   SI tmp_temp;
-  tmp_temp = ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-; return SRLSI (-1, [&](){ valid = 0; return 0; }()); }();
-; return [&](){ ORSI (ANDSI ([&](){ valid = 0; return 0; }(), INVSI (tmp_modulo_mask)), [&](){ valid = 0; return 0; }()); return ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr)); }(); }();
-}
-
-  return 4;
-}
-
-// ********** lwcpm0: lwcpm0 $crn,($rma+),$cdisp10a4
-
-static int
-mep_emu_lwcpm0 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-[&](){ SI val = ANDSI ([&](){ valid = 0; return 0; }(), INVSI (3)); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-;
-[&](){   SI tmp_modulo_mask;
-  tmp_modulo_mask = [&](){   SI tmp_temp;
-  tmp_temp = ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-; return SRLSI (-1, [&](){ valid = 0; return 0; }()); }();
-; return [&](){ ORSI (ANDSI ([&](){ valid = 0; return 0; }(), INVSI (tmp_modulo_mask)), [&](){ valid = 0; return 0; }()); return ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr)); }(); }();
-}
-
-  return 4;
-}
-
-// ********** smcpm0: smcpm0 $crn64,($rma+),$cdisp10a8
-
-static int
-mep_emu_smcpm0 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-[&](){   SI tmp_modulo_mask;
-  tmp_modulo_mask = [&](){   SI tmp_temp;
-  tmp_temp = ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-; return SRLSI (-1, [&](){ valid = 0; return 0; }()); }();
-; return [&](){ ORSI (ANDSI ([&](){ valid = 0; return 0; }(), INVSI (tmp_modulo_mask)), [&](){ valid = 0; return 0; }()); return ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr)); }(); }();
-}
-
-  return 4;
-}
-
-// ********** lmcpm0: lmcpm0 $crn64,($rma+),$cdisp10a8
-
-static int
-mep_emu_lmcpm0 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-[&](){ valid = 0; return 0; }();
-[&](){   SI tmp_modulo_mask;
-  tmp_modulo_mask = [&](){   SI tmp_temp;
-  tmp_temp = ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-; return SRLSI (-1, [&](){ valid = 0; return 0; }()); }();
-; return [&](){ ORSI (ANDSI ([&](){ valid = 0; return 0; }(), INVSI (tmp_modulo_mask)), [&](){ valid = 0; return 0; }()); return ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr)); }(); }();
-}
-
-  return 4;
-}
-
-// ********** sbcpm1: sbcpm1 $crn,($rma+),$cdisp10
-
-static int
-mep_emu_sbcpm1 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ QI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-[&](){   SI tmp_modulo_mask;
-  tmp_modulo_mask = [&](){   SI tmp_temp;
-  tmp_temp = ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-; return SRLSI (-1, [&](){ valid = 0; return 0; }()); }();
-; return [&](){ ORSI (ANDSI ([&](){ valid = 0; return 0; }(), INVSI (tmp_modulo_mask)), [&](){ valid = 0; return 0; }()); return ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr)); }(); }();
-}
-
-  return 4;
-}
-
-// ********** lbcpm1: lbcpm1 $crn,($rma+),$cdisp10
-
-static int
-mep_emu_lbcpm1 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-EXTQISI ([&](){ QI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-[&](){   SI tmp_modulo_mask;
-  tmp_modulo_mask = [&](){   SI tmp_temp;
-  tmp_temp = ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-; return SRLSI (-1, [&](){ valid = 0; return 0; }()); }();
-; return [&](){ ORSI (ANDSI ([&](){ valid = 0; return 0; }(), INVSI (tmp_modulo_mask)), [&](){ valid = 0; return 0; }()); return ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr)); }(); }();
-}
-
-  return 4;
-}
-
-// ********** shcpm1: shcpm1 $crn,($rma+),$cdisp10a2
-
-static int
-mep_emu_shcpm1 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ HI val = ANDSI ([&](){ valid = 0; return 0; }(), INVSI (1)); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-[&](){   SI tmp_modulo_mask;
-  tmp_modulo_mask = [&](){   SI tmp_temp;
-  tmp_temp = ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-; return SRLSI (-1, [&](){ valid = 0; return 0; }()); }();
-; return [&](){ ORSI (ANDSI ([&](){ valid = 0; return 0; }(), INVSI (tmp_modulo_mask)), [&](){ valid = 0; return 0; }()); return ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr)); }(); }();
-}
-
-  return 4;
-}
-
-// ********** lhcpm1: lhcpm1 $crn,($rma+),$cdisp10a2
-
-static int
-mep_emu_lhcpm1 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-EXTHISI ([&](){ HI val = ANDSI ([&](){ valid = 0; return 0; }(), INVSI (1)); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-[&](){   SI tmp_modulo_mask;
-  tmp_modulo_mask = [&](){   SI tmp_temp;
-  tmp_temp = ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-; return SRLSI (-1, [&](){ valid = 0; return 0; }()); }();
-; return [&](){ ORSI (ANDSI ([&](){ valid = 0; return 0; }(), INVSI (tmp_modulo_mask)), [&](){ valid = 0; return 0; }()); return ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr)); }(); }();
-}
-
-  return 4;
-}
-
-// ********** swcpm1: swcpm1 $crn,($rma+),$cdisp10a4
-
-static int
-mep_emu_swcpm1 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{ SI val = ANDSI ([&](){ valid = 0; return 0; }(), INVSI (3)); if (valid) insn_add_dref(insn, val, 0, dr_W); }
-[&](){   SI tmp_modulo_mask;
-  tmp_modulo_mask = [&](){   SI tmp_temp;
-  tmp_temp = ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-; return SRLSI (-1, [&](){ valid = 0; return 0; }()); }();
-; return [&](){ ORSI (ANDSI ([&](){ valid = 0; return 0; }(), INVSI (tmp_modulo_mask)), [&](){ valid = 0; return 0; }()); return ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr)); }(); }();
-}
-
-  return 4;
-}
-
-// ********** lwcpm1: lwcpm1 $crn,($rma+),$cdisp10a4
-
-static int
-mep_emu_lwcpm1 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-EXTSISI ([&](){ SI val = ANDSI ([&](){ valid = 0; return 0; }(), INVSI (3)); if (valid) insn_add_dref(insn, val, 0, dr_R); return 0; }()
-);
-[&](){   SI tmp_modulo_mask;
-  tmp_modulo_mask = [&](){   SI tmp_temp;
-  tmp_temp = ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-; return SRLSI (-1, [&](){ valid = 0; return 0; }()); }();
-; return [&](){ ORSI (ANDSI ([&](){ valid = 0; return 0; }(), INVSI (tmp_modulo_mask)), [&](){ valid = 0; return 0; }()); return ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr)); }(); }();
-}
-
-  return 4;
-}
-
-// ********** smcpm1: smcpm1 $crn64,($rma+),$cdisp10a8
-
-static int
-mep_emu_smcpm1 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-[&](){   SI tmp_modulo_mask;
-  tmp_modulo_mask = [&](){   SI tmp_temp;
-  tmp_temp = ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-; return SRLSI (-1, [&](){ valid = 0; return 0; }()); }();
-; return [&](){ ORSI (ANDSI ([&](){ valid = 0; return 0; }(), INVSI (tmp_modulo_mask)), [&](){ valid = 0; return 0; }()); return ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr)); }(); }();
-}
-
-  return 4;
-}
-
-// ********** lmcpm1: lmcpm1 $crn64,($rma+),$cdisp10a8
-
-static int
-mep_emu_lmcpm1 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-[&](){ valid = 0; return 0; }();
-[&](){   SI tmp_modulo_mask;
-  tmp_modulo_mask = [&](){   SI tmp_temp;
-  tmp_temp = ORSI ([&](){ valid = 0; return 0; }(), [&](){ valid = 0; return 0; }());
-; return SRLSI (-1, [&](){ valid = 0; return 0; }()); }();
-; return [&](){ ORSI (ANDSI ([&](){ valid = 0; return 0; }(), INVSI (tmp_modulo_mask)), [&](){ valid = 0; return 0; }()); return ADDSI ([&](){ valid = 0; return 0; }(), EXTSISI (insn.Op3.type == o_imm ? insn.Op3.value : insn.Op3.addr)); }(); }();
-}
-
-  return 4;
-}
-
-// ********** bcpeq: bcpeq $cccc,$pcrel17a2
-
-static int
-mep_emu_bcpeq (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{
-{ USI val = ((insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr) & ((~ (1)))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-}
-
-  return 4;
-}
-
-// ********** bcpne: bcpne $cccc,$pcrel17a2
-
-static int
-mep_emu_bcpne (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{
-{ USI val = ((insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr) & ((~ (1)))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-}
-
-  return 4;
-}
-
-// ********** bcpat: bcpat $cccc,$pcrel17a2
-
-static int
-mep_emu_bcpat (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{
-{ USI val = ((insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr) & ((~ (1)))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-}
-
-  return 4;
-}
-
-// ********** bcpaf: bcpaf $cccc,$pcrel17a2
-
-static int
-mep_emu_bcpaf (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{
-{ USI val = ((insn.Op2.type == o_imm ? insn.Op2.value : insn.Op2.addr) & ((~ (1)))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-}
-
-  return 4;
-}
-
-// ********** synccp: synccp
-
-static int
-mep_emu_synccp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-((void) 0); /*nop*/
-}
-
-  return 2;
-}
-
-// ********** jsrv: jsrv $rm
-
-static int
-mep_emu_jsrv (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{
-{
-ORSI (ADDSI (pc, 8), 1);
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (1))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-ORSI (ANDSI ([&](){ valid = 0; return 0; }(), (~ (((1) << (12))))), ((((1) << (12))) & (((0) << (12)))));
-}
-{
-ORSI (ADDSI (pc, 4), 1);
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (1))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-ORSI (ANDSI ([&](){ valid = 0; return 0; }(), (~ (((1) << (12))))), ((((1) << (12))) & (((0) << (12)))));
-}
-{
-ORSI (ADDSI (pc, 2), 1);
-{
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (3))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-{ USI val = ANDSI ([&](){ valid = 0; return 0; }(), (~ (7))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-ORSI (ANDSI ([&](){ valid = 0; return 0; }(), (~ (((1) << (12))))), ((((1) << (12))) & (((1) << (12)))));
-}
-}
-}
-
-  return 2;
-}
-
-// ********** bsrv: bsrv $pcrel24a2
-
-static int
-mep_emu_bsrv (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{
-{
-{
-ORSI (ADDSI (pc, 8), 1);
-{ USI val = ((insn.Op1.type == o_imm ? insn.Op1.value : insn.Op1.addr) & ((~ (1)))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-ORSI (ANDSI ([&](){ valid = 0; return 0; }(), (~ (((1) << (12))))), ((((1) << (12))) & (((0) << (12)))));
-}
-{
-ORSI (ADDSI (pc, 4), 1);
-{ USI val = ((insn.Op1.type == o_imm ? insn.Op1.value : insn.Op1.addr) & ((~ (1)))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-ORSI (ANDSI ([&](){ valid = 0; return 0; }(), (~ (((1) << (12))))), ((((1) << (12))) & (((0) << (12)))));
-}
-{
-ORSI (ADDSI (pc, 4), 1);
-{
-{ USI val = ((insn.Op1.type == o_imm ? insn.Op1.value : insn.Op1.addr) & ((~ (3)))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-{ USI val = ((insn.Op1.type == o_imm ? insn.Op1.value : insn.Op1.addr) & ((~ (7)))); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-}
-ORSI (ANDSI ([&](){ valid = 0; return 0; }(), (~ (((1) << (12))))), ((((1) << (12))) & (((1) << (12)))));
-}
-}
-}
-
-  return 4;
-}
-
-// ********** cp: cp $code24
-
-static int
-mep_emu_cp (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-
-  return 4;
-}
-
-// ********** sim-syscall: --syscall--
-
-static int
-mep_emu_sim_syscall (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-
-  return 2;
-}
-
-// ********** ri-0: --reserved--
-
-static int
-mep_emu_ri_0 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** ri-1: --reserved--
-
-static int
-mep_emu_ri_1 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** ri-2: --reserved--
-
-static int
-mep_emu_ri_2 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** ri-3: --reserved--
-
-static int
-mep_emu_ri_3 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** ri-4: --reserved--
-
-static int
-mep_emu_ri_4 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** ri-5: --reserved--
-
-static int
-mep_emu_ri_5 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** ri-6: --reserved--
-
-static int
-mep_emu_ri_6 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** ri-7: --reserved--
-
-static int
-mep_emu_ri_7 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** ri-8: --reserved--
-
-static int
-mep_emu_ri_8 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** ri-9: --reserved--
-
-static int
-mep_emu_ri_9 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** ri-10: --reserved--
-
-static int
-mep_emu_ri_10 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** ri-11: --reserved--
-
-static int
-mep_emu_ri_11 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** ri-12: --reserved--
-
-static int
-mep_emu_ri_12 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** ri-13: --reserved--
-
-static int
-mep_emu_ri_13 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** ri-14: --reserved--
-
-static int
-mep_emu_ri_14 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** ri-15: --reserved--
-
-static int
-mep_emu_ri_15 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** ri-17: --reserved--
-
-static int
-mep_emu_ri_17 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** ri-20: --reserved--
-
-static int
-mep_emu_ri_20 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** ri-21: --reserved--
-
-static int
-mep_emu_ri_21 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** ri-22: --reserved--
-
-static int
-mep_emu_ri_22 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** ri-23: --reserved--
-
-static int
-mep_emu_ri_23 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-// ********** ri-26: --reserved--
-
-static int
-mep_emu_ri_26 (const insn_t &insn)
-{
-  ea_t pc = insn.ea;
-  int valid = 1;
-
-{ USI val = [&](){ valid = 0; return 0; }(); if (valid) insn_add_cref(insn, val, 0, has_insn_feature(insn.itype, CF_CALL) ? fl_CN : fl_JN); }
-
-  return 2;
-}
-
-
-// Emulator entry
+    insn_t prev;
+    ea_t prev_ea = decode_prev_insn(&prev, cur_ea);
+    if ( prev_ea == BADADDR )
+      break;
+    cur_ea = prev_ea;
+
+    uint32 feature = prev.get_canon_feature(ph);
+    if ( (feature & CF_STOP) != 0 )
+      break;
+
+    // Check instructions that write to `reg`
+    switch ( prev.itype )
+    {
+      case MEP_INSN_MOVI8:
+      case MEP_INSN_MOVI16:
+        if ( prev.Op1.reg == reg )
+        {
+          if ( prev.Op2.type == o_mem )
+            *p_val = (uint32)prev.Op2.addr;
+          else
+            *p_val = (uint32)(int32)(int16)prev.Op2.value;
+          return true;
+        }
+        break;
+
+      case MEP_INSN_MOVU16:
+        if ( prev.Op1.reg == reg )
+        {
+          if ( prev.Op2.type == o_mem )
+            *p_val = (uint32)prev.Op2.addr;
+          else
+            *p_val = (uint32)(prev.Op2.value & 0xFFFF);
+          return true;
+        }
+        break;
+
+      case MEP_INSN_MOVU24:
+        if ( prev.Op1.reg == reg )
+        {
+          if ( prev.Op2.type == o_mem )
+            *p_val = (uint32)prev.Op2.addr;
+          else
+            *p_val = (uint32)(prev.Op2.value & 0xFFFFFF);
+          return true;
+        }
+        break;
+
+      case MEP_INSN_MOVH:
+        if ( prev.Op1.reg == reg )
+        {
+          // Note: ana.cpp stores (f_16u16 << 16) in Op2.value when o_imm.
+          // If Op2 was already converted to o_mem by refinfo, read the raw
+          // upper 16-bit immediate from the second halfword of the instruction.
+          uint32 hi = (prev.Op2.type == o_imm)
+                    ? (uint32)prev.Op2.value
+                    : ((uint32)get_word(prev.ea + 2) << 16);
+          *p_val = hi;
+          if ( p_movh_ea != nullptr )
+            *p_movh_ea = prev.ea;
+          return true;
+        }
+        break;
+
+      case MEP_INSN_MOV:
+        if ( prev.Op1.reg == reg && prev.Op2.type == o_reg )
+        {
+          reg = prev.Op2.reg;
+          if ( reg == MEP_REG_SP || reg == MEP_REG_FP )
+            return false;
+          continue;
+        }
+        break;
+
+      case MEP_INSN_ADD3X:
+        if ( prev.Op1.reg == reg )
+        {
+          if ( prev.Op3.type == o_mem )
+          {
+            *p_val = (uint32)prev.Op3.addr;
+            return true;
+          }
+          uval_t base_val = 0;
+          if ( find_reg_value(prev.ea, prev.Op2.reg, &base_val, nullptr, max_steps - step - 1) )
+          {
+            int16 simm16 = (prev.Op3.type == o_imm)
+                         ? (int16)prev.Op3.value
+                         : (int16)get_word(prev.ea + 2);
+            *p_val = (uint32)(base_val + (int32)simm16);
+            return true;
+          }
+          return false;
+        }
+        break;
+
+      case MEP_INSN_OR3:
+        if ( prev.Op1.reg == reg )
+        {
+          if ( prev.Op3.type == o_mem )
+          {
+            *p_val = (uint32)prev.Op3.addr;
+            return true;
+          }
+          uval_t base_val = 0;
+          if ( find_reg_value(prev.ea, prev.Op2.reg, &base_val, nullptr, max_steps - step - 1) )
+          {
+            uint16 uimm16 = (prev.Op3.type == o_imm)
+                          ? (uint16)prev.Op3.value
+                          : (uint16)get_word(prev.ea + 2);
+            *p_val = (uint32)(base_val | uimm16);
+            return true;
+          }
+          return false;
+        }
+        break;
+
+      case MEP_INSN_ADD:
+        if ( prev.Op1.reg == reg && prev.Op2.type == o_imm )
+        {
+          uval_t base_val = 0;
+          if ( find_reg_value(prev.ea, reg, &base_val, nullptr, max_steps - step - 1) )
+          {
+            *p_val = (uint32)(base_val + (int32)prev.Op2.value);
+            return true;
+          }
+          return false;
+        }
+        break;
+
+      default:
+        break;
+    }
+
+    // Stop if `prev` clobbers `reg`
+    if ( (feature & CF_CHG1) != 0 && prev.Op1.type == o_reg && prev.Op1.reg == reg )
+      return false;
+    if ( (feature & CF_CHG2) != 0 && prev.Op2.type == o_reg && prev.Op2.reg == reg )
+      return false;
+    if ( (feature & CF_CHG3) != 0 && prev.Op3.type == o_reg && prev.Op3.reg == reg )
+      return false;
+
+    // Calls clobber caller-saved registers $0..$4 and $lp
+    if ( (feature & CF_CALL) != 0 )
+    {
+      if ( (reg >= MEP_REG_R0 && reg <= MEP_REG_R4) || reg == MEP_REG_LP )
+        return false;
+    }
+  }
+
+  return find_global_base_symbol(reg, p_val);
+}
+
+//----------------------------------------------------------------------
+// Recognize Toshiba MeP switch/jump table idioms before an indirect `jmp $rm`
+bool mep_t::mep_is_switch(switch_info_t *si, const insn_t &insn)
+{
+  if ( insn.itype != MEP_INSN_JMP || insn.Op1.type != o_reg )
+    return false;
+
+  // Match pattern:
+  //   sl2ad3  $0, $idx, $base
+  //   movu24  $tmp, #jt_addr   (or movh + add3 / or3)
+  //   lh / lw $rm, ($0)
+  //   add     $rm, $tmp
+  //   jmp     $rm
+  insn_t prev;
+  if ( decode_prev_insn(&prev, insn.ea) == BADADDR )
+    return false;
+
+  if ( prev.itype != MEP_INSN_ADD )
+    return false;
+
+  int jump_reg = insn.Op1.reg;
+  if ( prev.Op1.reg != jump_reg )
+    return false;
+  int jt_addr_reg = prev.Op2.reg;
+
+  if ( decode_prev_insn(&prev, prev.ea) == BADADDR )
+    return false;
+
+  if ( prev.itype == MEP_INSN_LH )
+    si->flags |= SWI_SIGNED | SWI_ELBASE | SWI_V32;
+  else if ( prev.itype == MEP_INSN_LHU )
+    si->flags |= SWI_ELBASE | SWI_V32;
+  else if ( prev.itype == MEP_INSN_LW )
+    si->flags |= SWI_SIGNED | SWI_ELBASE | SWI_J32 | SWI_V32;
+  else
+    return false;
+
+  if ( prev.Op1.reg != jump_reg || prev.Op2.reg != MEP_REG_R0 )
+    return false;
+
+  ea_t load_ea = prev.ea;
+  if ( decode_prev_insn(&prev, load_ea) == BADADDR )
+    return false;
+
+  ea_t jt_addr = BADADDR;
+  if ( prev.itype == MEP_INSN_MOVU24 && prev.Op1.reg == jt_addr_reg )
+  {
+    jt_addr = (prev.Op2.type == o_mem) ? prev.Op2.addr : ea_t(prev.Op2.value);
+    if ( decode_prev_insn(&prev, prev.ea) == BADADDR )
+      return false;
+  }
+  else
+  {
+    uval_t resolved_jt = 0;
+    if ( !find_reg_value(load_ea, jt_addr_reg, &resolved_jt) )
+      return false;
+    jt_addr = (ea_t)resolved_jt;
+    // Step back over the address synthesis instructions to find sl1ad3/sl2ad3
+    while ( prev.itype != MEP_INSN_SL2AD3 && prev.itype != MEP_INSN_SL1AD3 )
+    {
+      if ( decode_prev_insn(&prev, prev.ea) == BADADDR )
+        return false;
+    }
+  }
+
+  if ( prev.itype != MEP_INSN_SL2AD3 && prev.itype != MEP_INSN_SL1AD3 )
+    return false;
+
+  int reg_a = prev.Op2.reg;
+  int reg_b = prev.Op3.reg;
+  if ( reg_a > MEP_REG_R12 || reg_b > MEP_REG_R12 )
+    return false;
+
+  int idx_reg = (reg_a == jt_addr_reg) ? reg_b : reg_a;
+  ea_t sl_ea = prev.ea;
+
+  // Walk backwards to find the bounds check:
+  //   sltu3 $0, $idx, #ncases   (or slt3 / blti / bgei)
+  //   beqz  $0, default_label
+  ea_t search_ea = sl_ea;
+  ea_t defjump = BADADDR;
+  int ncases = 0;
+  int lowcase = 0;
+  ea_t startea = sl_ea;
+
+  for ( int i = 0; i < 12; ++i )
+  {
+    if ( decode_prev_insn(&prev, search_ea) == BADADDR )
+      break;
+    search_ea = prev.ea;
+
+    if ( (prev.itype == MEP_INSN_BEQZ || prev.itype == MEP_INSN_BNEZ) && defjump == BADADDR )
+    {
+      defjump = prev.Op2.addr;
+    }
+    else if ( (prev.itype == MEP_INSN_SLTU3I || prev.itype == MEP_INSN_SLT3I)
+           && prev.Op2.reg == idx_reg
+           && prev.Op3.type == o_imm )
+    {
+      ncases = (int)prev.Op3.value;
+      startea = prev.ea;
+      // Check if preceded by `add $idx, -lowcase`
+      insn_t prev2;
+      if ( decode_prev_insn(&prev2, prev.ea) != BADADDR )
+      {
+        if ( prev2.itype == MEP_INSN_ADD && prev2.Op1.reg == idx_reg && prev2.Op2.type == o_imm )
+        {
+          lowcase = -(int)(int32)prev2.Op2.value;
+          startea = prev2.ea;
+        }
+        else if ( prev2.itype == MEP_INSN_ADD3X
+               && prev2.Op1.reg == idx_reg
+               && prev2.Op2.reg == idx_reg
+               && prev2.Op3.type == o_imm )
+        {
+          lowcase = -(int)(int16)prev2.Op3.value;
+          startea = prev2.ea;
+        }
+      }
+      break;
+    }
+    else if ( prev.itype == MEP_INSN_BGEI && prev.Op1.reg == idx_reg && prev.Op2.type == o_imm )
+    {
+      defjump = prev.Op3.addr;
+      ncases = (int)prev.Op2.value;
+      startea = prev.ea;
+      break;
+    }
+  }
+
+  if ( ncases <= 0 || jt_addr == BADADDR )
+    return false;
+
+  si->ncases = ushort(ncases);
+  si->jumps = jt_addr;
+  si->elbase = jt_addr;
+  si->lowcase = lowcase;
+  si->startea = startea;
+  if ( defjump != BADADDR )
+    si->defjump = defjump;
+  si->set_expr(idx_reg, dt_dword);
+  return true;
+}
+
+//----------------------------------------------------------------------
+// Stack pointer tracking and frame creation
+void mep_t::trace_sp(ea_t func_ea, const insn_t &insn)
+{
+  if ( func_ea == BADADDR )
+    return;
+
+  switch ( insn.itype )
+  {
+    case MEP_INSN_ADD:
+      if ( insn.Op1.reg == MEP_REG_SP && insn.Op2.type == o_imm )
+      {
+        sval_t delta = (int32)insn.Op2.value;
+        add_func_auto_stkpnt(func_ea, insn.ea + insn.size, delta);
+      }
+      break;
+
+    case MEP_INSN_ADD3X:
+      if ( insn.Op1.reg == MEP_REG_SP
+        && insn.Op2.reg == MEP_REG_SP
+        && insn.Op3.type == o_imm )
+      {
+        sval_t delta = (int16)insn.Op3.value;
+        add_func_auto_stkpnt(func_ea, insn.ea + insn.size, delta);
+      }
+      break;
+
+    case MEP_INSN_SUB:
+      if ( insn.Op1.reg == MEP_REG_SP && insn.Op2.type == o_reg )
+      {
+        uval_t val = 0;
+        if ( find_reg_value(insn.ea, insn.Op2.reg, &val) )
+          add_func_auto_stkpnt(func_ea, insn.ea + insn.size, -(sval_t)(int32)val);
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
+bool mep_t::create_func_frame(ea_t func_ea)
+{
+  if ( func_ea == BADADDR )
+    return false;
+
+  ea_t ea = func_ea;
+  sval_t frsize = 0;
+  ushort regsize = 0;
+  bool uses_fp = false;
+
+  for ( int i = 0; i < 10; ++i )
+  {
+    insn_t insn;
+    if ( decode_insn(&insn, ea) == 0 )
+      break;
+
+    if ( insn.itype == MEP_INSN_ADD
+      && insn.Op1.reg == MEP_REG_SP
+      && insn.Op2.type == o_imm
+      && (int32)insn.Op2.value < 0 )
+    {
+      frsize += -(int32)insn.Op2.value;
+    }
+    else if ( insn.itype == MEP_INSN_ADD3X
+           && insn.Op1.reg == MEP_REG_SP
+           && insn.Op2.reg == MEP_REG_SP
+           && insn.Op3.type == o_imm
+           && (int16)insn.Op3.value < 0 )
+    {
+      frsize += -(int16)insn.Op3.value;
+    }
+    else if ( (insn.itype == MEP_INSN_SW_SP || (insn.itype == MEP_INSN_SW16 && insn.Op3.reg == MEP_REG_SP))
+           && (insn.Op1.reg == MEP_REG_LP || insn.Op1.reg == MEP_REG_FP || (insn.Op1.reg >= MEP_REG_R5 && insn.Op1.reg <= MEP_REG_R12)) )
+    {
+      regsize += 4;
+    }
+    else if ( (insn.itype == MEP_INSN_MOV && insn.Op1.reg == MEP_REG_FP && insn.Op2.reg == MEP_REG_SP)
+           || (insn.itype == MEP_INSN_ADD3I && insn.Op1.reg == MEP_REG_FP && insn.Op2.reg == MEP_REG_SP) )
+    {
+      uses_fp = true;
+    }
+
+    uint32 feature = insn.get_canon_feature(ph);
+    if ( (feature & (CF_STOP | CF_CALL | CF_JUMP)) != 0 )
+      break;
+
+    ea += insn.size;
+  }
+
+  if ( frsize <= 0 )
+    return false;
+
+  if ( regsize > frsize )
+    regsize = 0;
+
+  uint64 flags = FUNC_FRAME | (uses_fp ? FUNC_BOTTOMBP : 0);
+  set_func_flag(func_ea, flags);
+  return add_frame_ea(func_ea, frsize - regsize, regsize, 0);
+}
+
+int mep_t::is_sp_based(const insn_t &insn, const op_t & /*op*/) const
+{
+  if ( insn.Op3.type == o_reg && insn.Op3.reg == MEP_REG_FP )
+    return OP_SP_ADD | OP_FP_BASED;
+  return OP_SP_ADD | OP_SP_BASED;
+}
+
+//----------------------------------------------------------------------
+// Helper to set refinfo without truncating REFINFO_* flags
+static void set_mep_refinfo(
+        ea_t ea,
+        int n,
+        uint32 type_and_flags,
+        ea_t target,
+        ea_t base = 0,
+        adiff_t tdelta = 0)
+{
+  refinfo_t ri;
+  ri.init(type_and_flags, base, target, tdelta);
+  set_refinfo_ex(ea, n, &ri);
+}
+
+//----------------------------------------------------------------------
+// Apply HIGH16 / LOW16 reference info to a `movh` + `add3x`/`or3`/`*16` pair
+static void apply_hi_lo_pair(
+        ea_t movh_ea,
+        const insn_t &lo_insn,
+        int lo_op_idx,
+        ea_t target,
+        dref_t lo_dref,
+        uint32 extra_flags = 0)
+{
+  if ( !is_mapped(target) )
+    return;
+
+  refinfo_t ri_hi;
+  if ( !get_refinfo(&ri_hi, movh_ea, 1) )
+  {
+    set_mep_refinfo(movh_ea, 1, REF_HIGH16 | extra_flags, target);
+    auto_mark(movh_ea, AU_USED);
+  }
+  add_dref(movh_ea, target, dr_O);
+
+  refinfo_t ri_lo;
+  if ( !get_refinfo(&ri_lo, lo_insn.ea, lo_op_idx) )
+  {
+    set_mep_refinfo(lo_insn.ea, lo_op_idx, REF_LOW16 | extra_flags, target);
+    auto_mark(lo_insn.ea, AU_USED);
+  }
+  lo_insn.add_dref(target, lo_insn.ops[lo_op_idx].offb, lo_dref);
+}
+
+//----------------------------------------------------------------------
+// Helper to determine whether an instruction is a memory store (vs load)
+static bool is_store_insn(uint16 itype)
+{
+  switch ( itype )
+  {
+    case MEP_INSN_SB:
+    case MEP_INSN_SH:
+    case MEP_INSN_SW:
+    case MEP_INSN_SW_SP:
+    case MEP_INSN_SB_TP:
+    case MEP_INSN_SH_TP:
+    case MEP_INSN_SW_TP:
+    case MEP_INSN_SB16:
+    case MEP_INSN_SH16:
+    case MEP_INSN_SW16:
+    case MEP_INSN_SW24:
+    case MEP_INSN_SWCP:
+    case MEP_INSN_SMCP:
+    case MEP_INSN_SWCPI:
+    case MEP_INSN_SMCPI:
+    case MEP_INSN_SWCP16:
+    case MEP_INSN_SMCP16:
+    case MEP_INSN_BSETM:
+    case MEP_INSN_BCLRM:
+    case MEP_INSN_BNOTM:
+    case MEP_INSN_TAS:
+    case MEP_INSN_CASB3:
+    case MEP_INSN_CASH3:
+    case MEP_INSN_CASW3:
+      return true;
+    default:
+      return false;
+  }
+}
+
+//----------------------------------------------------------------------
+// Main instruction emulator
 int mep_t::mep_emu(const insn_t &insn)
 {
-  int len;  switch (insn.itype)
+  uint32 feature = insn.get_canon_feature(ph);
+  bool flow = ((feature & CF_STOP) == 0);
+  flags64_t F = get_flags(insn.ea);
+
+  // Mark immediate operands and create user-specified offset xrefs
+  for ( int i = 0; i < UA_MAXOP; ++i )
   {
-    case MEP_INSN_X_INVALID: len = mep_emu_x_invalid(insn); break;
-    case MEP_INSN_STCB_R: len = mep_emu_stcb_r(insn); break;
-    case MEP_INSN_LDCB_R: len = mep_emu_ldcb_r(insn); break;
-    case MEP_INSN_PREF: len = mep_emu_pref(insn); break;
-    case MEP_INSN_PREFD: len = mep_emu_prefd(insn); break;
-    case MEP_INSN_CASB3: len = mep_emu_casb3(insn); break;
-    case MEP_INSN_CASH3: len = mep_emu_cash3(insn); break;
-    case MEP_INSN_CASW3: len = mep_emu_casw3(insn); break;
-    case MEP_INSN_SBCP: len = mep_emu_sbcp(insn); break;
-    case MEP_INSN_LBCP: len = mep_emu_lbcp(insn); break;
-    case MEP_INSN_LBUCP: len = mep_emu_lbucp(insn); break;
-    case MEP_INSN_SHCP: len = mep_emu_shcp(insn); break;
-    case MEP_INSN_LHCP: len = mep_emu_lhcp(insn); break;
-    case MEP_INSN_LHUCP: len = mep_emu_lhucp(insn); break;
-    case MEP_INSN_LBUCPA: len = mep_emu_lbucpa(insn); break;
-    case MEP_INSN_LHUCPA: len = mep_emu_lhucpa(insn); break;
-    case MEP_INSN_LBUCPM0: len = mep_emu_lbucpm0(insn); break;
-    case MEP_INSN_LHUCPM0: len = mep_emu_lhucpm0(insn); break;
-    case MEP_INSN_LBUCPM1: len = mep_emu_lbucpm1(insn); break;
-    case MEP_INSN_LHUCPM1: len = mep_emu_lhucpm1(insn); break;
-    case MEP_INSN_UCI: len = mep_emu_uci(insn); break;
-    case MEP_INSN_DSP: len = mep_emu_dsp(insn); break;
-    case MEP_INSN_SB: len = mep_emu_sb(insn); break;
-    case MEP_INSN_SH: len = mep_emu_sh(insn); break;
-    case MEP_INSN_SW: len = mep_emu_sw(insn); break;
-    case MEP_INSN_LB: len = mep_emu_lb(insn); break;
-    case MEP_INSN_LH: len = mep_emu_lh(insn); break;
-    case MEP_INSN_LW: len = mep_emu_lw(insn); break;
-    case MEP_INSN_LBU: len = mep_emu_lbu(insn); break;
-    case MEP_INSN_LHU: len = mep_emu_lhu(insn); break;
-    case MEP_INSN_SW_SP: len = mep_emu_sw_sp(insn); break;
-    case MEP_INSN_LW_SP: len = mep_emu_lw_sp(insn); break;
-    case MEP_INSN_SB_TP: len = mep_emu_sb_tp(insn); break;
-    case MEP_INSN_SH_TP: len = mep_emu_sh_tp(insn); break;
-    case MEP_INSN_SW_TP: len = mep_emu_sw_tp(insn); break;
-    case MEP_INSN_LB_TP: len = mep_emu_lb_tp(insn); break;
-    case MEP_INSN_LH_TP: len = mep_emu_lh_tp(insn); break;
-    case MEP_INSN_LW_TP: len = mep_emu_lw_tp(insn); break;
-    case MEP_INSN_LBU_TP: len = mep_emu_lbu_tp(insn); break;
-    case MEP_INSN_LHU_TP: len = mep_emu_lhu_tp(insn); break;
-    case MEP_INSN_SB16: len = mep_emu_sb16(insn); break;
-    case MEP_INSN_SH16: len = mep_emu_sh16(insn); break;
-    case MEP_INSN_SW16: len = mep_emu_sw16(insn); break;
-    case MEP_INSN_LB16: len = mep_emu_lb16(insn); break;
-    case MEP_INSN_LH16: len = mep_emu_lh16(insn); break;
-    case MEP_INSN_LW16: len = mep_emu_lw16(insn); break;
-    case MEP_INSN_LBU16: len = mep_emu_lbu16(insn); break;
-    case MEP_INSN_LHU16: len = mep_emu_lhu16(insn); break;
-    case MEP_INSN_SW24: len = mep_emu_sw24(insn); break;
-    case MEP_INSN_LW24: len = mep_emu_lw24(insn); break;
-    case MEP_INSN_EXTB: len = mep_emu_extb(insn); break;
-    case MEP_INSN_EXTH: len = mep_emu_exth(insn); break;
-    case MEP_INSN_EXTUB: len = mep_emu_extub(insn); break;
-    case MEP_INSN_EXTUH: len = mep_emu_extuh(insn); break;
-    case MEP_INSN_SSARB: len = mep_emu_ssarb(insn); break;
-    case MEP_INSN_MOV: len = mep_emu_mov(insn); break;
-    case MEP_INSN_MOVI8: len = mep_emu_movi8(insn); break;
-    case MEP_INSN_MOVI16: len = mep_emu_movi16(insn); break;
-    case MEP_INSN_MOVU24: len = mep_emu_movu24(insn); break;
-    case MEP_INSN_MOVU16: len = mep_emu_movu16(insn); break;
-    case MEP_INSN_MOVH: len = mep_emu_movh(insn); break;
-    case MEP_INSN_ADD3: len = mep_emu_add3(insn); break;
-    case MEP_INSN_ADD: len = mep_emu_add(insn); break;
-    case MEP_INSN_ADD3I: len = mep_emu_add3i(insn); break;
-    case MEP_INSN_ADVCK3: len = mep_emu_advck3(insn); break;
-    case MEP_INSN_SUB: len = mep_emu_sub(insn); break;
-    case MEP_INSN_SBVCK3: len = mep_emu_sbvck3(insn); break;
-    case MEP_INSN_NEG: len = mep_emu_neg(insn); break;
-    case MEP_INSN_SLT3: len = mep_emu_slt3(insn); break;
-    case MEP_INSN_SLTU3: len = mep_emu_sltu3(insn); break;
-    case MEP_INSN_SLT3I: len = mep_emu_slt3i(insn); break;
-    case MEP_INSN_SLTU3I: len = mep_emu_sltu3i(insn); break;
-    case MEP_INSN_SL1AD3: len = mep_emu_sl1ad3(insn); break;
-    case MEP_INSN_SL2AD3: len = mep_emu_sl2ad3(insn); break;
-    case MEP_INSN_ADD3X: len = mep_emu_add3x(insn); break;
-    case MEP_INSN_SLT3X: len = mep_emu_slt3x(insn); break;
-    case MEP_INSN_SLTU3X: len = mep_emu_sltu3x(insn); break;
-    case MEP_INSN_OR: len = mep_emu_or(insn); break;
-    case MEP_INSN_AND: len = mep_emu_and(insn); break;
-    case MEP_INSN_XOR: len = mep_emu_xor(insn); break;
-    case MEP_INSN_NOR: len = mep_emu_nor(insn); break;
-    case MEP_INSN_OR3: len = mep_emu_or3(insn); break;
-    case MEP_INSN_AND3: len = mep_emu_and3(insn); break;
-    case MEP_INSN_XOR3: len = mep_emu_xor3(insn); break;
-    case MEP_INSN_SRA: len = mep_emu_sra(insn); break;
-    case MEP_INSN_SRL: len = mep_emu_srl(insn); break;
-    case MEP_INSN_SLL: len = mep_emu_sll(insn); break;
-    case MEP_INSN_SRAI: len = mep_emu_srai(insn); break;
-    case MEP_INSN_SRLI: len = mep_emu_srli(insn); break;
-    case MEP_INSN_SLLI: len = mep_emu_slli(insn); break;
-    case MEP_INSN_SLL3: len = mep_emu_sll3(insn); break;
-    case MEP_INSN_FSFT: len = mep_emu_fsft(insn); break;
-    case MEP_INSN_BRA: len = mep_emu_bra(insn); break;
-    case MEP_INSN_BEQZ: len = mep_emu_beqz(insn); break;
-    case MEP_INSN_BNEZ: len = mep_emu_bnez(insn); break;
-    case MEP_INSN_BEQI: len = mep_emu_beqi(insn); break;
-    case MEP_INSN_BNEI: len = mep_emu_bnei(insn); break;
-    case MEP_INSN_BLTI: len = mep_emu_blti(insn); break;
-    case MEP_INSN_BGEI: len = mep_emu_bgei(insn); break;
-    case MEP_INSN_BEQ: len = mep_emu_beq(insn); break;
-    case MEP_INSN_BNE: len = mep_emu_bne(insn); break;
-    case MEP_INSN_BSR12: len = mep_emu_bsr12(insn); break;
-    case MEP_INSN_BSR24: len = mep_emu_bsr24(insn); break;
-    case MEP_INSN_JMP: len = mep_emu_jmp(insn); break;
-    case MEP_INSN_JMP24: len = mep_emu_jmp24(insn); break;
-    case MEP_INSN_JSR: len = mep_emu_jsr(insn); break;
-    case MEP_INSN_RET: len = mep_emu_ret(insn); break;
-    case MEP_INSN_REPEAT: len = mep_emu_repeat(insn); break;
-    case MEP_INSN_EREPEAT: len = mep_emu_erepeat(insn); break;
-    case MEP_INSN_STC_LP: len = mep_emu_stc_lp(insn); break;
-    case MEP_INSN_STC_HI: len = mep_emu_stc_hi(insn); break;
-    case MEP_INSN_STC_LO: len = mep_emu_stc_lo(insn); break;
-    case MEP_INSN_STC: len = mep_emu_stc(insn); break;
-    case MEP_INSN_LDC_LP: len = mep_emu_ldc_lp(insn); break;
-    case MEP_INSN_LDC_HI: len = mep_emu_ldc_hi(insn); break;
-    case MEP_INSN_LDC_LO: len = mep_emu_ldc_lo(insn); break;
-    case MEP_INSN_LDC: len = mep_emu_ldc(insn); break;
-    case MEP_INSN_DI: len = mep_emu_di(insn); break;
-    case MEP_INSN_EI: len = mep_emu_ei(insn); break;
-    case MEP_INSN_RETI: len = mep_emu_reti(insn); break;
-    case MEP_INSN_HALT: len = mep_emu_halt(insn); break;
-    case MEP_INSN_SLEEP: len = mep_emu_sleep(insn); break;
-    case MEP_INSN_SWI: len = mep_emu_swi(insn); break;
-    case MEP_INSN_BREAK: len = mep_emu_break(insn); break;
-    case MEP_INSN_SYNCM: len = mep_emu_syncm(insn); break;
-    case MEP_INSN_STCB: len = mep_emu_stcb(insn); break;
-    case MEP_INSN_LDCB: len = mep_emu_ldcb(insn); break;
-    case MEP_INSN_BSETM: len = mep_emu_bsetm(insn); break;
-    case MEP_INSN_BCLRM: len = mep_emu_bclrm(insn); break;
-    case MEP_INSN_BNOTM: len = mep_emu_bnotm(insn); break;
-    case MEP_INSN_BTSTM: len = mep_emu_btstm(insn); break;
-    case MEP_INSN_TAS: len = mep_emu_tas(insn); break;
-    case MEP_INSN_CACHE: len = mep_emu_cache(insn); break;
-    case MEP_INSN_MUL: len = mep_emu_mul(insn); break;
-    case MEP_INSN_MULU: len = mep_emu_mulu(insn); break;
-    case MEP_INSN_MULR: len = mep_emu_mulr(insn); break;
-    case MEP_INSN_MULRU: len = mep_emu_mulru(insn); break;
-    case MEP_INSN_MADD: len = mep_emu_madd(insn); break;
-    case MEP_INSN_MADDU: len = mep_emu_maddu(insn); break;
-    case MEP_INSN_MADDR: len = mep_emu_maddr(insn); break;
-    case MEP_INSN_MADDRU: len = mep_emu_maddru(insn); break;
-    case MEP_INSN_DIV: len = mep_emu_div(insn); break;
-    case MEP_INSN_DIVU: len = mep_emu_divu(insn); break;
-    case MEP_INSN_DRET: len = mep_emu_dret(insn); break;
-    case MEP_INSN_DBREAK: len = mep_emu_dbreak(insn); break;
-    case MEP_INSN_LDZ: len = mep_emu_ldz(insn); break;
-    case MEP_INSN_ABS: len = mep_emu_abs(insn); break;
-    case MEP_INSN_AVE: len = mep_emu_ave(insn); break;
-    case MEP_INSN_MIN: len = mep_emu_min(insn); break;
-    case MEP_INSN_MAX: len = mep_emu_max(insn); break;
-    case MEP_INSN_MINU: len = mep_emu_minu(insn); break;
-    case MEP_INSN_MAXU: len = mep_emu_maxu(insn); break;
-    case MEP_INSN_CLIP: len = mep_emu_clip(insn); break;
-    case MEP_INSN_CLIPU: len = mep_emu_clipu(insn); break;
-    case MEP_INSN_SADD: len = mep_emu_sadd(insn); break;
-    case MEP_INSN_SSUB: len = mep_emu_ssub(insn); break;
-    case MEP_INSN_SADDU: len = mep_emu_saddu(insn); break;
-    case MEP_INSN_SSUBU: len = mep_emu_ssubu(insn); break;
-    case MEP_INSN_SWCP: len = mep_emu_swcp(insn); break;
-    case MEP_INSN_LWCP: len = mep_emu_lwcp(insn); break;
-    case MEP_INSN_SMCP: len = mep_emu_smcp(insn); break;
-    case MEP_INSN_LMCP: len = mep_emu_lmcp(insn); break;
-    case MEP_INSN_SWCPI: len = mep_emu_swcpi(insn); break;
-    case MEP_INSN_LWCPI: len = mep_emu_lwcpi(insn); break;
-    case MEP_INSN_SMCPI: len = mep_emu_smcpi(insn); break;
-    case MEP_INSN_LMCPI: len = mep_emu_lmcpi(insn); break;
-    case MEP_INSN_SWCP16: len = mep_emu_swcp16(insn); break;
-    case MEP_INSN_LWCP16: len = mep_emu_lwcp16(insn); break;
-    case MEP_INSN_SMCP16: len = mep_emu_smcp16(insn); break;
-    case MEP_INSN_LMCP16: len = mep_emu_lmcp16(insn); break;
-    case MEP_INSN_SBCPA: len = mep_emu_sbcpa(insn); break;
-    case MEP_INSN_LBCPA: len = mep_emu_lbcpa(insn); break;
-    case MEP_INSN_SHCPA: len = mep_emu_shcpa(insn); break;
-    case MEP_INSN_LHCPA: len = mep_emu_lhcpa(insn); break;
-    case MEP_INSN_SWCPA: len = mep_emu_swcpa(insn); break;
-    case MEP_INSN_LWCPA: len = mep_emu_lwcpa(insn); break;
-    case MEP_INSN_SMCPA: len = mep_emu_smcpa(insn); break;
-    case MEP_INSN_LMCPA: len = mep_emu_lmcpa(insn); break;
-    case MEP_INSN_SBCPM0: len = mep_emu_sbcpm0(insn); break;
-    case MEP_INSN_LBCPM0: len = mep_emu_lbcpm0(insn); break;
-    case MEP_INSN_SHCPM0: len = mep_emu_shcpm0(insn); break;
-    case MEP_INSN_LHCPM0: len = mep_emu_lhcpm0(insn); break;
-    case MEP_INSN_SWCPM0: len = mep_emu_swcpm0(insn); break;
-    case MEP_INSN_LWCPM0: len = mep_emu_lwcpm0(insn); break;
-    case MEP_INSN_SMCPM0: len = mep_emu_smcpm0(insn); break;
-    case MEP_INSN_LMCPM0: len = mep_emu_lmcpm0(insn); break;
-    case MEP_INSN_SBCPM1: len = mep_emu_sbcpm1(insn); break;
-    case MEP_INSN_LBCPM1: len = mep_emu_lbcpm1(insn); break;
-    case MEP_INSN_SHCPM1: len = mep_emu_shcpm1(insn); break;
-    case MEP_INSN_LHCPM1: len = mep_emu_lhcpm1(insn); break;
-    case MEP_INSN_SWCPM1: len = mep_emu_swcpm1(insn); break;
-    case MEP_INSN_LWCPM1: len = mep_emu_lwcpm1(insn); break;
-    case MEP_INSN_SMCPM1: len = mep_emu_smcpm1(insn); break;
-    case MEP_INSN_LMCPM1: len = mep_emu_lmcpm1(insn); break;
-    case MEP_INSN_BCPEQ: len = mep_emu_bcpeq(insn); break;
-    case MEP_INSN_BCPNE: len = mep_emu_bcpne(insn); break;
-    case MEP_INSN_BCPAT: len = mep_emu_bcpat(insn); break;
-    case MEP_INSN_BCPAF: len = mep_emu_bcpaf(insn); break;
-    case MEP_INSN_SYNCCP: len = mep_emu_synccp(insn); break;
-    case MEP_INSN_JSRV: len = mep_emu_jsrv(insn); break;
-    case MEP_INSN_BSRV: len = mep_emu_bsrv(insn); break;
-    case MEP_INSN_CP: len = mep_emu_cp(insn); break;
-    case MEP_INSN_SIM_SYSCALL: len = mep_emu_sim_syscall(insn); break;
-    case MEP_INSN_RI_0: len = mep_emu_ri_0(insn); break;
-    case MEP_INSN_RI_1: len = mep_emu_ri_1(insn); break;
-    case MEP_INSN_RI_2: len = mep_emu_ri_2(insn); break;
-    case MEP_INSN_RI_3: len = mep_emu_ri_3(insn); break;
-    case MEP_INSN_RI_4: len = mep_emu_ri_4(insn); break;
-    case MEP_INSN_RI_5: len = mep_emu_ri_5(insn); break;
-    case MEP_INSN_RI_6: len = mep_emu_ri_6(insn); break;
-    case MEP_INSN_RI_7: len = mep_emu_ri_7(insn); break;
-    case MEP_INSN_RI_8: len = mep_emu_ri_8(insn); break;
-    case MEP_INSN_RI_9: len = mep_emu_ri_9(insn); break;
-    case MEP_INSN_RI_10: len = mep_emu_ri_10(insn); break;
-    case MEP_INSN_RI_11: len = mep_emu_ri_11(insn); break;
-    case MEP_INSN_RI_12: len = mep_emu_ri_12(insn); break;
-    case MEP_INSN_RI_13: len = mep_emu_ri_13(insn); break;
-    case MEP_INSN_RI_14: len = mep_emu_ri_14(insn); break;
-    case MEP_INSN_RI_15: len = mep_emu_ri_15(insn); break;
-    case MEP_INSN_RI_17: len = mep_emu_ri_17(insn); break;
-    case MEP_INSN_RI_20: len = mep_emu_ri_20(insn); break;
-    case MEP_INSN_RI_21: len = mep_emu_ri_21(insn); break;
-    case MEP_INSN_RI_22: len = mep_emu_ri_22(insn); break;
-    case MEP_INSN_RI_23: len = mep_emu_ri_23(insn); break;
-    case MEP_INSN_RI_26: len = mep_emu_ri_26(insn); break;
-    default: len = 0; break;
-  }
-  if (len && !has_insn_feature(insn.itype, CF_STOP))
-  {
-    insn_add_cref(insn, insn.ea+len, 0, fl_F);
-  } else if (may_trace_sp()) {
-    recalc_spd(insn.ea);
+    const op_t &op = insn.ops[i];
+    if ( op.type == o_void )
+      break;
+    if ( op.type == o_imm )
+    {
+      set_immd(insn.ea);
+      if ( op_adds_xrefs(F, i) )
+        insn.add_off_drefs(op, dr_O, OOFW_IMM | OOF_SIGNED);
+    }
   }
 
-  if (insn.ea == g_rptail)
+  switch ( insn.itype )
   {
-      add_cref(g_rptail, g_rpb, fl_JN);
-      g_rptail = 0;
-      g_rpb = 0;
+    //------------------------------------------------------------------
+    // Unconditional direct branches / jumps
+    //------------------------------------------------------------------
+    case MEP_INSN_BRA:
+    case MEP_INSN_JMP24:
+      insn.add_cref(insn.Op1.addr, insn.Op1.offb, fl_JN);
+      flow = false;
+      break;
+
+    //------------------------------------------------------------------
+    // Indirect jump: jmp $rm
+    //------------------------------------------------------------------
+    case MEP_INSN_JMP:
+      {
+        flow = false;
+        switch_info_t si;
+        if ( get_switch_info(&si, insn.ea) <= 0 )
+        {
+          uval_t target = 0;
+          if ( find_reg_value(insn.ea, insn.Op1.reg, &target) && is_mapped(target & ~uval_t(1)) )
+            insn.add_cref(target & ~uval_t(1), insn.Op1.offb, fl_JN);
+          else
+            remember_problem(PR_JUMP, insn.ea);
+        }
+      }
+      break;
+
+    //------------------------------------------------------------------
+    // Conditional branches (2-operand: Op2 = target)
+    //------------------------------------------------------------------
+    case MEP_INSN_BEQZ:
+    case MEP_INSN_BNEZ:
+    case MEP_INSN_BCPEQ:
+    case MEP_INSN_BCPNE:
+    case MEP_INSN_BCPAT:
+    case MEP_INSN_BCPAF:
+      insn.add_cref(insn.Op2.addr, insn.Op2.offb, fl_JN);
+      break;
+
+    //------------------------------------------------------------------
+    // Conditional branches (3-operand: Op3 = target)
+    //------------------------------------------------------------------
+    case MEP_INSN_BEQI:
+    case MEP_INSN_BNEI:
+    case MEP_INSN_BLTI:
+    case MEP_INSN_BGEI:
+    case MEP_INSN_BEQ:
+    case MEP_INSN_BNE:
+      insn.add_cref(insn.Op3.addr, insn.Op3.offb, fl_JN);
+      break;
+
+    //------------------------------------------------------------------
+    // Direct subroutine calls: bsr12, bsr24, bsrv
+    //------------------------------------------------------------------
+    case MEP_INSN_BSR12:
+    case MEP_INSN_BSR24:
+    case MEP_INSN_BSRV:
+      {
+        ea_t target = insn.Op1.addr & ~ea_t(1);
+        insn.add_cref(target, insn.Op1.offb, fl_CN);
+        if ( !func_does_return(target) )
+          flow = false;
+      }
+      break;
+
+    //------------------------------------------------------------------
+    // Indirect subroutine calls: jsr $rm, jsrv $rm
+    //------------------------------------------------------------------
+    case MEP_INSN_JSR:
+    case MEP_INSN_JSRV:
+      {
+        uval_t target = 0;
+        if ( find_reg_value(insn.ea, insn.Op1.reg, &target) && is_mapped(target & ~uval_t(1)) )
+        {
+          ea_t call_ea = ea_t(target & ~uval_t(1));
+          insn.add_cref(call_ea, insn.Op1.offb, fl_CF);
+          if ( !func_does_return(call_ea) )
+            flow = false;
+        }
+        else
+        {
+          remember_problem(PR_JUMP, insn.ea);
+        }
+      }
+      break;
+
+    //------------------------------------------------------------------
+    // Zero-overhead hardware loops: repeat $rn, rpe_target / erepeat rpe_target
+    // Per MeP-c4 Spec (p. 158, 199):
+    //   rpb <- PC + 4
+    //   rpe <- target & ~1  (or | 1 for erepeat)
+    // When PC[31:1] == rpe[31:1], hardware branches back to rpb.
+    // Note: Some assemblers encode rpe_target as the label immediately
+    // following the last loop instruction; if rpe_target is an unconditional
+    // return/jump or outside the loop, also check the preceding instruction.
+    //------------------------------------------------------------------
+    case MEP_INSN_REPEAT:
+    case MEP_INSN_EREPEAT:
+      {
+        bool is_erepeat = (insn.itype == MEP_INSN_EREPEAT);
+        const op_t &targ_op = is_erepeat ? insn.Op1 : insn.Op2;
+        ea_t rpb_ea = insn.ea + insn.size;
+        ea_t rpe_ea = targ_op.addr & ~ea_t(1);
+
+        // Add an offset reference to rpe_ea so IDA creates a label there
+        // and out_print_address renders the loop-end symbol cleanly.
+        insn.add_dref(rpe_ea, targ_op.offb, dr_O);
+
+        // Determine the loop tail instruction:
+        // Per the MeP architecture specification, RPE is the address of the
+        // last instruction in the loop body, which cannot be a branch/ret.
+        // However, if a toolchain emitted RPE as the address just past the
+        // last loop instruction (e.g. pointing to a `ret` or `bra`), fall
+        // back to the preceding instruction.
+        ea_t tail_ea = rpe_ea;
+        insn_t rpe_insn;
+        if ( decode_insn(&rpe_insn, rpe_ea) > 0 )
+        {
+          uint32 rpe_feat = rpe_insn.get_canon_feature(ph);
+          if ( (rpe_feat & (CF_STOP | CF_JUMP)) != 0 && rpe_ea > rpb_ea )
+          {
+            ea_t prev_ea = prev_not_tail(rpe_ea);
+            if ( prev_ea != BADADDR && prev_ea >= rpb_ea )
+              tail_ea = prev_ea;
+          }
+        }
+
+        if ( tail_ea >= rpb_ea )
+        {
+          set_repeat_loop(tail_ea, rpb_ea, is_erepeat);
+          auto_mark(tail_ea, AU_USED);
+        }
+      }
+      break;
+
+    //------------------------------------------------------------------
+    // 24-bit absolute address instructions: sw24, lw24, movu24
+    //------------------------------------------------------------------
+    case MEP_INSN_SW24:
+      insn.add_dref(insn.Op2.addr, insn.Op2.offb, dr_W);
+      break;
+
+    case MEP_INSN_LW24:
+      insn.add_dref(insn.Op2.addr, insn.Op2.offb, dr_R);
+      break;
+
+    case MEP_INSN_MOVU24:
+      if ( insn.Op2.type == o_mem )
+        insn.add_dref(insn.Op2.addr, insn.Op2.offb, dr_O);
+      break;
+
+    //------------------------------------------------------------------
+    // High-halfword load: movh $rn, $uimm16
+    //------------------------------------------------------------------
+    case MEP_INSN_MOVH:
+      if ( insn.Op2.type == o_mem )
+        insn.add_dref(insn.Op2.addr, insn.Op2.offb, dr_O);
+      break;
+
+    //------------------------------------------------------------------
+    // 3-operand add / bitwise-or with 16-bit immediate:
+    //   add3 $rn, $rm, $simm16  (MEP_INSN_ADD3X)
+    //   or3  $rn, $rm, $uimm16  (MEP_INSN_OR3)
+    // Used to complete 32-bit addresses started by `movh` or to compute
+    // stack/global-pointer offsets.
+    //------------------------------------------------------------------
+    case MEP_INSN_ADD3X:
+      if ( insn.Op3.type == o_mem )
+      {
+        insn.add_dref(insn.Op3.addr, insn.Op3.offb, dr_O);
+      }
+      else if ( (insn.Op2.reg == MEP_REG_SP || insn.Op2.reg == MEP_REG_FP)
+             && insn.Op1.reg != MEP_REG_SP )
+      {
+        if ( may_create_stkvars() && !is_defarg(F, 2) )
+        {
+          ea_t func_ea = get_func_start(insn.ea);
+          if ( func_ea != BADADDR && (get_func_flags(func_ea) & FUNC_FRAME) != 0 )
+          {
+            sval_t disp = (int16)insn.Op3.value;
+            if ( insn.create_stkvar(insn.Op3, disp, 0) )
+              op_stkvar(insn.ea, 2);
+          }
+        }
+      }
+      else if ( insn.Op2.reg != MEP_REG_SP && insn.Op2.reg != MEP_REG_FP )
+      {
+        uval_t base_val = 0;
+        ea_t movh_ea = BADADDR;
+        if ( find_reg_value(insn.ea, insn.Op2.reg, &base_val, &movh_ea) )
+        {
+          ea_t target = (uint32)(base_val + (int32)(int16)insn.Op3.value);
+          if ( movh_ea != BADADDR )
+          {
+            apply_hi_lo_pair(movh_ea, insn, 2, target, dr_O, REFINFO_SIGNEDOP);
+          }
+          else if ( is_mapped(target) )
+          {
+            set_mep_refinfo(insn.ea, 2, REF_OFF32 | REFINFO_SIGNEDOP, target, base_val, 0);
+            insn.add_dref(target, insn.Op3.offb, dr_O);
+            auto_mark(insn.ea, AU_USED);
+          }
+        }
+      }
+      break;
+
+    case MEP_INSN_OR3:
+      if ( insn.Op3.type == o_mem )
+      {
+        insn.add_dref(insn.Op3.addr, insn.Op3.offb, dr_O);
+      }
+      else
+      {
+        uval_t base_val = 0;
+        ea_t movh_ea = BADADDR;
+        if ( find_reg_value(insn.ea, insn.Op2.reg, &base_val, &movh_ea) && movh_ea != BADADDR )
+        {
+          ea_t target = (uint32)(base_val | (uint16)insn.Op3.value);
+          apply_hi_lo_pair(movh_ea, insn, 2, target, dr_O);
+        }
+      }
+      break;
+
+    //------------------------------------------------------------------
+    // SP-relative add: add3 $rn, $sp, $uimm7a4
+    //------------------------------------------------------------------
+    case MEP_INSN_ADD3I:
+      if ( insn.Op1.reg != MEP_REG_SP && may_create_stkvars() && !is_defarg(F, 2) )
+      {
+        ea_t func_ea = get_func_start(insn.ea);
+        if ( func_ea != BADADDR && (get_func_flags(func_ea) & FUNC_FRAME) != 0 )
+        {
+          sval_t disp = (sval_t)insn.Op3.value;
+          if ( insn.create_stkvar(insn.Op3, disp, 0) )
+            op_stkvar(insn.ea, 2);
+        }
+      }
+      break;
+
+    //------------------------------------------------------------------
+    // SP-relative word load/store: sw $rn, udisp7a4($sp), lw $rn, udisp7a4($sp)
+    //------------------------------------------------------------------
+    case MEP_INSN_SW_SP:
+    case MEP_INSN_LW_SP:
+      if ( may_create_stkvars() && !is_defarg(F, 1) )
+      {
+        ea_t func_ea = get_func_start(insn.ea);
+        if ( func_ea != BADADDR && (get_func_flags(func_ea) & FUNC_FRAME) != 0 )
+        {
+          sval_t disp = (sval_t)insn.Op2.value;
+          if ( insn.create_stkvar(insn.Op2, disp, STKVAR_VALID_SIZE) )
+            op_stkvar(insn.ea, 1);
+        }
+      }
+      break;
+
+    //------------------------------------------------------------------
+    // TP-relative loads/stores: sb/sh/sw/lb/lh/lw/lbu/lhu $rn3, udisp7*($tp)
+    //------------------------------------------------------------------
+    case MEP_INSN_SB_TP:
+    case MEP_INSN_SH_TP:
+    case MEP_INSN_SW_TP:
+    case MEP_INSN_LB_TP:
+    case MEP_INSN_LH_TP:
+    case MEP_INSN_LW_TP:
+    case MEP_INSN_LBU_TP:
+    case MEP_INSN_LHU_TP:
+      {
+        dref_t dref = is_store_insn(insn.itype) ? dr_W : dr_R;
+        if ( insn.Op2.type == o_mem )
+        {
+          insn.add_dref(insn.Op2.addr, insn.Op2.offb, dref);
+        }
+        else
+        {
+          uval_t tp_val = 0;
+          if ( find_reg_value(insn.ea, MEP_REG_TP, &tp_val) )
+          {
+            ea_t target = (uint32)(tp_val + (uint32)insn.Op2.value);
+            if ( is_mapped(target) )
+            {
+              set_mep_refinfo(insn.ea, 1, REF_OFF32, target, tp_val, 0);
+              insn.add_dref(target, insn.Op2.offb, dref);
+              auto_mark(insn.ea, AU_USED);
+            }
+          }
+        }
+      }
+      break;
+
+    //------------------------------------------------------------------
+    // 16-bit signed displacement loads/stores:
+    //   sb16, sh16, sw16, lb16, lh16, lw16, lbu16, lhu16 $rn, sdisp16($rm)
+    //------------------------------------------------------------------
+    case MEP_INSN_SB16:
+    case MEP_INSN_SH16:
+    case MEP_INSN_SW16:
+    case MEP_INSN_LB16:
+    case MEP_INSN_LH16:
+    case MEP_INSN_LW16:
+    case MEP_INSN_LBU16:
+    case MEP_INSN_LHU16:
+      {
+        dref_t dref = is_store_insn(insn.itype) ? dr_W : dr_R;
+        if ( insn.Op2.type == o_mem )
+        {
+          insn.add_dref(insn.Op2.addr, insn.Op2.offb, dref);
+        }
+        else if ( insn.Op3.reg == MEP_REG_SP || insn.Op3.reg == MEP_REG_FP )
+        {
+          if ( may_create_stkvars() && !is_defarg(F, 1) )
+          {
+            ea_t func_ea = get_func_start(insn.ea);
+            if ( func_ea != BADADDR && (get_func_flags(func_ea) & FUNC_FRAME) != 0 )
+            {
+              sval_t disp = (int16)insn.Op2.value;
+              if ( insn.create_stkvar(insn.Op2, disp, STKVAR_VALID_SIZE) )
+                op_stkvar(insn.ea, 1);
+            }
+          }
+        }
+        else
+        {
+          uval_t base_val = 0;
+          ea_t movh_ea = BADADDR;
+          if ( find_reg_value(insn.ea, insn.Op3.reg, &base_val, &movh_ea) )
+          {
+            ea_t target = (uint32)(base_val + (int32)(int16)insn.Op2.value);
+            if ( movh_ea != BADADDR )
+            {
+              apply_hi_lo_pair(movh_ea, insn, 1, target, dref, REFINFO_SIGNEDOP);
+            }
+            else if ( is_mapped(target) )
+            {
+              set_mep_refinfo(insn.ea, 1, REF_OFF32 | REFINFO_SIGNEDOP, target, base_val, 0);
+              insn.add_dref(target, insn.Op2.offb, dref);
+              auto_mark(insn.ea, AU_USED);
+            }
+          }
+        }
+      }
+      break;
+
+    //------------------------------------------------------------------
+    // Coprocessor 16-bit displacement loads/stores:
+    //   swcp16, lwcp16, smcp16, lmcp16 $crn, sdisp16($rm)
+    //------------------------------------------------------------------
+    case MEP_INSN_SWCP16:
+    case MEP_INSN_LWCP16:
+    case MEP_INSN_SMCP16:
+    case MEP_INSN_LMCP16:
+      {
+        dref_t dref = is_store_insn(insn.itype) ? dr_W : dr_R;
+        uval_t base_val = 0;
+        ea_t movh_ea = BADADDR;
+        if ( find_reg_value(insn.ea, insn.Op3.reg, &base_val, &movh_ea) )
+        {
+          ea_t target = (uint32)(base_val + (int32)(int16)insn.Op2.value);
+          if ( is_mapped(target) )
+            insn.add_dref(target, insn.Op2.offb, dref);
+        }
+      }
+      break;
+
+    //------------------------------------------------------------------
+    // Register-indirect loads/stores:
+    //   sb, sh, sw, lb, lh, lw, lbu, lhu $rn, ($rm)
+    //   swcp, lwcp, smcp, lmcp, swcpi, lwcpi, smcpi, lmcpi $crn, ($rm[+])
+    //   bsetm, bclrm, bnotm, btstm ($rm), $uimm3
+    //   tas $rn, ($rm)
+    //   casb3, cash3, casw3 $rl, $rn, ($rm)
+    //------------------------------------------------------------------
+    case MEP_INSN_SB:
+    case MEP_INSN_SH:
+    case MEP_INSN_SW:
+    case MEP_INSN_LB:
+    case MEP_INSN_LH:
+    case MEP_INSN_LW:
+    case MEP_INSN_LBU:
+    case MEP_INSN_LHU:
+    case MEP_INSN_SWCP:
+    case MEP_INSN_LWCP:
+    case MEP_INSN_SMCP:
+    case MEP_INSN_LMCP:
+    case MEP_INSN_SWCPI:
+    case MEP_INSN_LWCPI:
+    case MEP_INSN_SMCPI:
+    case MEP_INSN_LMCPI:
+    case MEP_INSN_TAS:
+      {
+        uval_t addr = 0;
+        if ( find_reg_value(insn.ea, insn.Op2.reg, &addr) && is_mapped(addr) )
+        {
+          dref_t dref = is_store_insn(insn.itype) ? dr_W : dr_R;
+          insn.add_dref(addr, insn.Op2.offb, dref);
+          if ( insn.itype == MEP_INSN_TAS )
+            insn.add_dref(addr, insn.Op2.offb, dr_R);
+        }
+      }
+      break;
+
+    case MEP_INSN_BSETM:
+    case MEP_INSN_BCLRM:
+    case MEP_INSN_BNOTM:
+    case MEP_INSN_BTSTM:
+      {
+        uval_t addr = 0;
+        if ( find_reg_value(insn.ea, insn.Op1.reg, &addr) && is_mapped(addr) )
+        {
+          insn.add_dref(addr, insn.Op1.offb, dr_R);
+          if ( insn.itype != MEP_INSN_BTSTM )
+            insn.add_dref(addr, insn.Op1.offb, dr_W);
+        }
+      }
+      break;
+
+    case MEP_INSN_CASB3:
+    case MEP_INSN_CASH3:
+    case MEP_INSN_CASW3:
+      {
+        uval_t addr = 0;
+        if ( find_reg_value(insn.ea, insn.Op3.reg, &addr) && is_mapped(addr) )
+        {
+          insn.add_dref(addr, insn.Op3.offb, dr_R);
+          insn.add_dref(addr, insn.Op3.offb, dr_W);
+        }
+      }
+      break;
+
+    default:
+      break;
+  }
+
+  // Handle hardware zero-overhead loop tail (`repeat` / `erepeat`)
+  ea_t rpb_ea = BADADDR;
+  bool is_erepeat = false;
+  if ( get_repeat_loop(insn.ea, &rpb_ea, &is_erepeat) )
+  {
+    insn.add_cref(rpb_ea, 0, fl_JN);
+    if ( is_erepeat )
+      flow = false;
+  }
+
+  // Add normal fallthrough execution flow
+  if ( flow )
+    add_cref(insn.ea, insn.ea + insn.size, fl_F);
+
+  // Trace stack pointer modifications
+  ea_t func_ea = get_func_start(insn.ea);
+  if ( may_trace_sp() && func_ea != BADADDR )
+  {
+    if ( !recalc_func_spd_for_basic_block(func_ea, insn.ea) )
+      trace_sp(func_ea, insn);
   }
 
   return 1;

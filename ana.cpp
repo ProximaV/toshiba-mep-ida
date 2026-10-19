@@ -54,7 +54,7 @@ static inline uint64_t get_bits (const void *p, int bits, int big_p)
 
 static inline CGEN_INSN_WORD get_insn_value(unsigned char *buf, int length)
 {
-  int big_p = 0;
+  int big_p = inf_is_be() ? 1 : 0;
   int insn_chunk_bitsize = 16;
   CGEN_INSN_WORD value = 0;
 
@@ -75,12 +75,12 @@ static inline CGEN_INSN_WORD get_insn_value(unsigned char *buf, int length)
 
     bit_index = i; /* NB: not dependent on endianness; opposite of cgen_put_insn_value! */
     this_value = get_bits (& buf[bit_index / 8], insn_chunk_bitsize, big_p);
-    value = (value << insn_chunk_bitsize) | this_value;
+    value = (CGEN_INSN_WORD)((value << insn_chunk_bitsize) | this_value);
   }
     }
   else
     {
-      value = get_bits (buf, length, big_p);
+      value = (CGEN_INSN_WORD)get_bits (buf, length, big_p);
     }
 
   return value;
@@ -88,20 +88,25 @@ static inline CGEN_INSN_WORD get_insn_value(unsigned char *buf, int length)
 
 static inline ea_t calc_reference_target(ea_t from, const refinfo_t &ri, adiff_t opval)
 {
-  ea_t target;
-  ea_t base;
-  calc_reference_data(&target, &base, from, ri, opval);
-  return base+target;
+  if (ri.target != BADADDR)
+    return ri.target;
+  ea_t target = BADADDR;
+  ea_t base = 0;
+  if (calc_reference_data(&target, &base, from, ri, opval))
+    return target;
+  return BADADDR;
 }
 
 /* Analyze the current instruction.  */
 
 int mep_t::mep_ana(insn_t *_insn)
 {
+  if (_insn == nullptr)
+    return 0;
   insn_t &ida_insn = *_insn;
 
   /* temporary buffer */
-  unsigned char buffer[4];
+  unsigned char buffer[4] = { 0 };
 
   /* Result of decoder.  */
   MEP_INSN_TYPE itype;
@@ -109,7 +114,9 @@ int mep_t::mep_ana(insn_t *_insn)
   CGEN_INSN_WORD insn;
   CGEN_INSN_WORD entire_insn;
   ea_t pc;
-  get_data_value((uval_t *)buffer, ida_insn.ea, 4);
+  ssize_t nbytes = get_bytes(buffer, sizeof(buffer), ida_insn.ea);
+  if (nbytes < 2)
+    return 0;
   insn = get_insn_value(buffer, 16);
   entire_insn = get_insn_value(buffer, 32);
   pc = ida_insn.ea;
@@ -117,6 +124,8 @@ int mep_t::mep_ana(insn_t *_insn)
 
     {
       unsigned int val = (((insn >> 8) & (15 << 4)) | ((insn >> 0) & (15 << 0)));
+      if (val >= 192 && nbytes < 4)
+        return 0;
       switch (val)
       {
       case 0 :
@@ -139,7 +148,7 @@ int mep_t::mep_ana(insn_t *_insn)
         itype = MEP_INSN_SBVCK3; goto extract_sfmt_advck3;
       case 6 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_0; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 7 :
         entire_insn = entire_insn >> 16;
         itype = MEP_INSN_ADVCK3; goto extract_sfmt_advck3;
@@ -199,10 +208,10 @@ int mep_t::mep_ana(insn_t *_insn)
         itype = MEP_INSN_DIVU; goto extract_sfmt_div;
       case 26 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_1; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 27 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_2; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 28 :
         entire_insn = entire_insn >> 16;
         if ((entire_insn & 0xfc0f) == 0x100c)
@@ -284,7 +293,7 @@ int mep_t::mep_ana(insn_t *_insn)
         itype = MEP_INSN_TAS; goto extract_sfmt_tas;
       case 37 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_3; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 38 :
         entire_insn = entire_insn >> 16;
         itype = MEP_INSN_SL1AD3; goto extract_sfmt_sl1ad3;
@@ -293,16 +302,16 @@ int mep_t::mep_ana(insn_t *_insn)
         itype = MEP_INSN_SL2AD3; goto extract_sfmt_sl1ad3;
       case 40 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_4; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 41 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_5; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 42 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_6; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 43 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_7; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 44 :
         entire_insn = entire_insn >> 16;
         itype = MEP_INSN_SRL; goto extract_sfmt_sub;
@@ -329,16 +338,16 @@ int mep_t::mep_ana(insn_t *_insn)
         itype = MEP_INSN_LMCPI; goto extract_sfmt_lmcpi;
       case 52 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_8; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 53 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_9; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 54 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_10; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 55 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_11; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 56 :
         entire_insn = entire_insn >> 16;
         itype = MEP_INSN_SWCP; goto extract_sfmt_swcp;
@@ -353,16 +362,16 @@ int mep_t::mep_ana(insn_t *_insn)
         itype = MEP_INSN_LMCP; goto extract_sfmt_lmcp;
       case 60 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_12; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 61 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_13; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 62 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_14; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 63 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_15; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 64 : /* fall through */
       case 68 : /* fall through */
       case 72 : /* fall through */
@@ -586,7 +595,7 @@ int mep_t::mep_ana(insn_t *_insn)
         itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 119 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_17; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 120 :
         {
           unsigned int val = (((insn >> 4) & (15 << 0)));
@@ -665,10 +674,10 @@ int mep_t::mep_ana(insn_t *_insn)
         itype = MEP_INSN_LDCB_R; goto extract_sfmt_ldcb_r;
       case 126 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_20; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 127 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_21; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 128 : /* fall through */
       case 130 : /* fall through */
       case 132 : /* fall through */
@@ -806,7 +815,7 @@ int mep_t::mep_ana(insn_t *_insn)
       case 198 : itype = MEP_INSN_XOR3; goto extract_sfmt_or3;
       case 199 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_22; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 200 : itype = MEP_INSN_SB16; goto extract_sfmt_sb16;
       case 201 : itype = MEP_INSN_SH16; goto extract_sfmt_sh16;
       case 202 : itype = MEP_INSN_SW16; goto extract_sfmt_sw16;
@@ -941,7 +950,7 @@ int mep_t::mep_ana(insn_t *_insn)
       case 236 : itype = MEP_INSN_BLTI; goto extract_sfmt_beqi;
       case 237 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_23; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 240 : itype = MEP_INSN_DSP; goto extract_sfmt_dsp;
       case 241 :
         {
@@ -1121,10 +1130,27 @@ int mep_t::mep_ana(insn_t *_insn)
           default : itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
           }
         }
-      case 247 : itype = MEP_INSN_CP; goto extract_sfmt_cp;
+      case 247 :
+        if ((entire_insn & 0xf00ff000) == 0xf007f000)
+        {
+          if ((entire_insn & 0xf00ffff7) == 0xf007f000)
+            { itype = MEP_INSN_CMOV1; goto extract_sfmt_cmov1; }
+          if ((entire_insn & 0xf00ffff7) == 0xf007f001)
+            { itype = MEP_INSN_CMOV2; goto extract_sfmt_cmov2; }
+          if ((entire_insn & 0xf00ffff3) == 0xf007f002)
+            { itype = MEP_INSN_CMOVC1; goto extract_sfmt_cmovc1; }
+          if ((entire_insn & 0xf00ffff3) == 0xf007f003)
+            { itype = MEP_INSN_CMOVC2; goto extract_sfmt_cmovc2; }
+          if ((entire_insn & 0xf00ffff7) == 0xf007f100)
+            { itype = MEP_INSN_CMOVH1; goto extract_sfmt_cmovh1; }
+          if ((entire_insn & 0xf00ffff7) == 0xf007f101)
+            { itype = MEP_INSN_CMOVH2; goto extract_sfmt_cmovh2; }
+          itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
+        }
+        itype = MEP_INSN_CP; goto extract_sfmt_cp;
       case 248 :
         entire_insn = entire_insn >> 16;
-        itype = MEP_INSN_RI_26; goto extract_sfmt_break;
+        itype = MEP_INSN_X_INVALID; goto extract_sfmt_empty;
       case 252 : itype = MEP_INSN_SWCP16; goto extract_sfmt_swcp16;
       case 253 : itype = MEP_INSN_LWCP16; goto extract_sfmt_lwcp16;
       case 254 : itype = MEP_INSN_SMCP16; goto extract_sfmt_smcp16;
@@ -1796,9 +1822,12 @@ int mep_t::mep_ana(insn_t *_insn)
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RNL;
     ida_insn.Op2.type = o_imm;
-    ida_insn.Op2.dtype = get_dtype_by_size(4);
+    ida_insn.Op2.dtype = dt_dword;
     ida_insn.Op2.value = f_7u9a4;
     ida_insn.Op2.cgen_optype = MEP_OPERAND_UDISP7A4;
+    ida_insn.Op3.type = o_reg;
+    ida_insn.Op3.reg = REGS_HW_H_GPR_BASE + 15;
+    ida_insn.Op3.cgen_optype = MEP_OPERAND_SPR;
 
     ida_insn.itype = itype;
     ida_insn.size = 2;
@@ -1816,12 +1845,15 @@ int mep_t::mep_ana(insn_t *_insn)
 
     /* Record the operands  */
     ida_insn.Op2.type = o_imm;
-    ida_insn.Op2.dtype = get_dtype_by_size(4);
+    ida_insn.Op2.dtype = dt_dword;
     ida_insn.Op2.value = f_7u9a4;
     ida_insn.Op2.cgen_optype = MEP_OPERAND_UDISP7A4;
     ida_insn.Op1.type = o_reg;
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RNL;
+    ida_insn.Op3.type = o_reg;
+    ida_insn.Op3.reg = REGS_HW_H_GPR_BASE + 15;
+    ida_insn.Op3.cgen_optype = MEP_OPERAND_SPR;
 
     ida_insn.itype = itype;
     ida_insn.size = 2;
@@ -1842,9 +1874,19 @@ int mep_t::mep_ana(insn_t *_insn)
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn3;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RN3C;
     ida_insn.Op2.type = o_imm;
-    ida_insn.Op2.dtype = get_dtype_by_size(4);
+    ida_insn.Op2.dtype = dt_byte;
     ida_insn.Op2.value = f_7u9;
     ida_insn.Op2.cgen_optype = MEP_OPERAND_UDISP7;
+    ida_insn.Op3.type = o_reg;
+    ida_insn.Op3.reg = REGS_HW_H_GPR_BASE + 13;
+    ida_insn.Op3.cgen_optype = MEP_OPERAND_TPR;
+
+    refinfo_t ri;
+    if (get_refinfo(&ri, ida_insn.ea, 1))
+    {
+      ida_insn.Op2.type = o_mem;
+      ida_insn.Op2.addr = calc_reference_target(ida_insn.ea, ri, f_7u9);
+    }
 
     ida_insn.itype = itype;
     ida_insn.size = 2;
@@ -1865,9 +1907,19 @@ int mep_t::mep_ana(insn_t *_insn)
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn3;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RN3S;
     ida_insn.Op2.type = o_imm;
-    ida_insn.Op2.dtype = get_dtype_by_size(4);
+    ida_insn.Op2.dtype = dt_word;
     ida_insn.Op2.value = f_7u9a2;
     ida_insn.Op2.cgen_optype = MEP_OPERAND_UDISP7A2;
+    ida_insn.Op3.type = o_reg;
+    ida_insn.Op3.reg = REGS_HW_H_GPR_BASE + 13;
+    ida_insn.Op3.cgen_optype = MEP_OPERAND_TPR;
+
+    refinfo_t ri;
+    if (get_refinfo(&ri, ida_insn.ea, 1))
+    {
+      ida_insn.Op2.type = o_mem;
+      ida_insn.Op2.addr = calc_reference_target(ida_insn.ea, ri, f_7u9a2);
+    }
 
     ida_insn.itype = itype;
     ida_insn.size = 2;
@@ -1888,9 +1940,19 @@ int mep_t::mep_ana(insn_t *_insn)
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn3;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RN3L;
     ida_insn.Op2.type = o_imm;
-    ida_insn.Op2.dtype = get_dtype_by_size(4);
+    ida_insn.Op2.dtype = dt_dword;
     ida_insn.Op2.value = f_7u9a4;
     ida_insn.Op2.cgen_optype = MEP_OPERAND_UDISP7A4;
+    ida_insn.Op3.type = o_reg;
+    ida_insn.Op3.reg = REGS_HW_H_GPR_BASE + 13;
+    ida_insn.Op3.cgen_optype = MEP_OPERAND_TPR;
+
+    refinfo_t ri;
+    if (get_refinfo(&ri, ida_insn.ea, 1))
+    {
+      ida_insn.Op2.type = o_mem;
+      ida_insn.Op2.addr = calc_reference_target(ida_insn.ea, ri, f_7u9a4);
+    }
 
     ida_insn.itype = itype;
     ida_insn.size = 2;
@@ -1908,12 +1970,22 @@ int mep_t::mep_ana(insn_t *_insn)
 
     /* Record the operands  */
     ida_insn.Op2.type = o_imm;
-    ida_insn.Op2.dtype = get_dtype_by_size(4);
+    ida_insn.Op2.dtype = dt_byte;
     ida_insn.Op2.value = f_7u9;
     ida_insn.Op2.cgen_optype = MEP_OPERAND_UDISP7;
     ida_insn.Op1.type = o_reg;
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn3;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RN3C;
+    ida_insn.Op3.type = o_reg;
+    ida_insn.Op3.reg = REGS_HW_H_GPR_BASE + 13;
+    ida_insn.Op3.cgen_optype = MEP_OPERAND_TPR;
+
+    refinfo_t ri;
+    if (get_refinfo(&ri, ida_insn.ea, 1))
+    {
+      ida_insn.Op2.type = o_mem;
+      ida_insn.Op2.addr = calc_reference_target(ida_insn.ea, ri, f_7u9);
+    }
 
     ida_insn.itype = itype;
     ida_insn.size = 2;
@@ -1931,12 +2003,22 @@ int mep_t::mep_ana(insn_t *_insn)
 
     /* Record the operands  */
     ida_insn.Op2.type = o_imm;
-    ida_insn.Op2.dtype = get_dtype_by_size(4);
+    ida_insn.Op2.dtype = dt_word;
     ida_insn.Op2.value = f_7u9a2;
     ida_insn.Op2.cgen_optype = MEP_OPERAND_UDISP7A2;
     ida_insn.Op1.type = o_reg;
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn3;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RN3S;
+    ida_insn.Op3.type = o_reg;
+    ida_insn.Op3.reg = REGS_HW_H_GPR_BASE + 13;
+    ida_insn.Op3.cgen_optype = MEP_OPERAND_TPR;
+
+    refinfo_t ri;
+    if (get_refinfo(&ri, ida_insn.ea, 1))
+    {
+      ida_insn.Op2.type = o_mem;
+      ida_insn.Op2.addr = calc_reference_target(ida_insn.ea, ri, f_7u9a2);
+    }
 
     ida_insn.itype = itype;
     ida_insn.size = 2;
@@ -1954,12 +2036,22 @@ int mep_t::mep_ana(insn_t *_insn)
 
     /* Record the operands  */
     ida_insn.Op2.type = o_imm;
-    ida_insn.Op2.dtype = get_dtype_by_size(4);
+    ida_insn.Op2.dtype = dt_dword;
     ida_insn.Op2.value = f_7u9a4;
     ida_insn.Op2.cgen_optype = MEP_OPERAND_UDISP7A4;
     ida_insn.Op1.type = o_reg;
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn3;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RN3L;
+    ida_insn.Op3.type = o_reg;
+    ida_insn.Op3.reg = REGS_HW_H_GPR_BASE + 13;
+    ida_insn.Op3.cgen_optype = MEP_OPERAND_TPR;
+
+    refinfo_t ri;
+    if (get_refinfo(&ri, ida_insn.ea, 1))
+    {
+      ida_insn.Op2.type = o_mem;
+      ida_insn.Op2.addr = calc_reference_target(ida_insn.ea, ri, f_7u9a4);
+    }
 
     ida_insn.itype = itype;
     ida_insn.size = 2;
@@ -1977,12 +2069,22 @@ int mep_t::mep_ana(insn_t *_insn)
 
     /* Record the operands  */
     ida_insn.Op2.type = o_imm;
-    ida_insn.Op2.dtype = get_dtype_by_size(4);
+    ida_insn.Op2.dtype = dt_byte;
     ida_insn.Op2.value = f_7u9;
     ida_insn.Op2.cgen_optype = MEP_OPERAND_UDISP7;
     ida_insn.Op1.type = o_reg;
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn3;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RN3UC;
+    ida_insn.Op3.type = o_reg;
+    ida_insn.Op3.reg = REGS_HW_H_GPR_BASE + 13;
+    ida_insn.Op3.cgen_optype = MEP_OPERAND_TPR;
+
+    refinfo_t ri;
+    if (get_refinfo(&ri, ida_insn.ea, 1))
+    {
+      ida_insn.Op2.type = o_mem;
+      ida_insn.Op2.addr = calc_reference_target(ida_insn.ea, ri, f_7u9);
+    }
 
     ida_insn.itype = itype;
     ida_insn.size = 2;
@@ -2000,12 +2102,22 @@ int mep_t::mep_ana(insn_t *_insn)
 
     /* Record the operands  */
     ida_insn.Op2.type = o_imm;
-    ida_insn.Op2.dtype = get_dtype_by_size(4);
+    ida_insn.Op2.dtype = dt_word;
     ida_insn.Op2.value = f_7u9a2;
     ida_insn.Op2.cgen_optype = MEP_OPERAND_UDISP7A2;
     ida_insn.Op1.type = o_reg;
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn3;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RN3US;
+    ida_insn.Op3.type = o_reg;
+    ida_insn.Op3.reg = REGS_HW_H_GPR_BASE + 13;
+    ida_insn.Op3.cgen_optype = MEP_OPERAND_TPR;
+
+    refinfo_t ri;
+    if (get_refinfo(&ri, ida_insn.ea, 1))
+    {
+      ida_insn.Op2.type = o_mem;
+      ida_insn.Op2.addr = calc_reference_target(ida_insn.ea, ri, f_7u9a2);
+    }
 
     ida_insn.itype = itype;
     ida_insn.size = 2;
@@ -2031,9 +2143,16 @@ int mep_t::mep_ana(insn_t *_insn)
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RNC;
     ida_insn.Op2.type = o_imm;
-    ida_insn.Op2.dtype = get_dtype_by_size(4);
+    ida_insn.Op2.dtype = dt_byte;
     ida_insn.Op2.value = f_16s16;
     ida_insn.Op2.cgen_optype = MEP_OPERAND_SDISP16;
+
+    refinfo_t ri;
+    if (get_refinfo(&ri, ida_insn.ea, 1))
+    {
+      ida_insn.Op2.type = o_mem;
+      ida_insn.Op2.addr = calc_reference_target(ida_insn.ea, ri, f_16s16);
+    }
 
     ida_insn.itype = itype;
     ida_insn.size = 4;
@@ -2059,9 +2178,16 @@ int mep_t::mep_ana(insn_t *_insn)
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RNS;
     ida_insn.Op2.type = o_imm;
-    ida_insn.Op2.dtype = get_dtype_by_size(4);
+    ida_insn.Op2.dtype = dt_word;
     ida_insn.Op2.value = f_16s16;
     ida_insn.Op2.cgen_optype = MEP_OPERAND_SDISP16;
+
+    refinfo_t ri;
+    if (get_refinfo(&ri, ida_insn.ea, 1))
+    {
+      ida_insn.Op2.type = o_mem;
+      ida_insn.Op2.addr = calc_reference_target(ida_insn.ea, ri, f_16s16);
+    }
 
     ida_insn.itype = itype;
     ida_insn.size = 4;
@@ -2087,9 +2213,16 @@ int mep_t::mep_ana(insn_t *_insn)
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RNL;
     ida_insn.Op2.type = o_imm;
-    ida_insn.Op2.dtype = get_dtype_by_size(4);
+    ida_insn.Op2.dtype = dt_dword;
     ida_insn.Op2.value = f_16s16;
     ida_insn.Op2.cgen_optype = MEP_OPERAND_SDISP16;
+
+    refinfo_t ri;
+    if (get_refinfo(&ri, ida_insn.ea, 1))
+    {
+      ida_insn.Op2.type = o_mem;
+      ida_insn.Op2.addr = calc_reference_target(ida_insn.ea, ri, f_16s16);
+    }
 
     ida_insn.itype = itype;
     ida_insn.size = 4;
@@ -2112,12 +2245,19 @@ int mep_t::mep_ana(insn_t *_insn)
     ida_insn.Op3.reg = REGS_HW_H_GPR_BASE + f_rm;
     ida_insn.Op3.cgen_optype = MEP_OPERAND_RMA;
     ida_insn.Op2.type = o_imm;
-    ida_insn.Op2.dtype = get_dtype_by_size(4);
+    ida_insn.Op2.dtype = dt_byte;
     ida_insn.Op2.value = f_16s16;
     ida_insn.Op2.cgen_optype = MEP_OPERAND_SDISP16;
     ida_insn.Op1.type = o_reg;
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RNC;
+
+    refinfo_t ri;
+    if (get_refinfo(&ri, ida_insn.ea, 1))
+    {
+      ida_insn.Op2.type = o_mem;
+      ida_insn.Op2.addr = calc_reference_target(ida_insn.ea, ri, f_16s16);
+    }
 
     ida_insn.itype = itype;
     ida_insn.size = 4;
@@ -2140,12 +2280,19 @@ int mep_t::mep_ana(insn_t *_insn)
     ida_insn.Op3.reg = REGS_HW_H_GPR_BASE + f_rm;
     ida_insn.Op3.cgen_optype = MEP_OPERAND_RMA;
     ida_insn.Op2.type = o_imm;
-    ida_insn.Op2.dtype = get_dtype_by_size(4);
+    ida_insn.Op2.dtype = dt_word;
     ida_insn.Op2.value = f_16s16;
     ida_insn.Op2.cgen_optype = MEP_OPERAND_SDISP16;
     ida_insn.Op1.type = o_reg;
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RNS;
+
+    refinfo_t ri;
+    if (get_refinfo(&ri, ida_insn.ea, 1))
+    {
+      ida_insn.Op2.type = o_mem;
+      ida_insn.Op2.addr = calc_reference_target(ida_insn.ea, ri, f_16s16);
+    }
 
     ida_insn.itype = itype;
     ida_insn.size = 4;
@@ -2168,12 +2315,19 @@ int mep_t::mep_ana(insn_t *_insn)
     ida_insn.Op3.reg = REGS_HW_H_GPR_BASE + f_rm;
     ida_insn.Op3.cgen_optype = MEP_OPERAND_RMA;
     ida_insn.Op2.type = o_imm;
-    ida_insn.Op2.dtype = get_dtype_by_size(4);
+    ida_insn.Op2.dtype = dt_dword;
     ida_insn.Op2.value = f_16s16;
     ida_insn.Op2.cgen_optype = MEP_OPERAND_SDISP16;
     ida_insn.Op1.type = o_reg;
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RNL;
+
+    refinfo_t ri;
+    if (get_refinfo(&ri, ida_insn.ea, 1))
+    {
+      ida_insn.Op2.type = o_mem;
+      ida_insn.Op2.addr = calc_reference_target(ida_insn.ea, ri, f_16s16);
+    }
 
     ida_insn.itype = itype;
     ida_insn.size = 4;
@@ -2196,12 +2350,19 @@ int mep_t::mep_ana(insn_t *_insn)
     ida_insn.Op3.reg = REGS_HW_H_GPR_BASE + f_rm;
     ida_insn.Op3.cgen_optype = MEP_OPERAND_RMA;
     ida_insn.Op2.type = o_imm;
-    ida_insn.Op2.dtype = get_dtype_by_size(4);
+    ida_insn.Op2.dtype = dt_byte;
     ida_insn.Op2.value = f_16s16;
     ida_insn.Op2.cgen_optype = MEP_OPERAND_SDISP16;
     ida_insn.Op1.type = o_reg;
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RNUC;
+
+    refinfo_t ri;
+    if (get_refinfo(&ri, ida_insn.ea, 1))
+    {
+      ida_insn.Op2.type = o_mem;
+      ida_insn.Op2.addr = calc_reference_target(ida_insn.ea, ri, f_16s16);
+    }
 
     ida_insn.itype = itype;
     ida_insn.size = 4;
@@ -2224,12 +2385,19 @@ int mep_t::mep_ana(insn_t *_insn)
     ida_insn.Op3.reg = REGS_HW_H_GPR_BASE + f_rm;
     ida_insn.Op3.cgen_optype = MEP_OPERAND_RMA;
     ida_insn.Op2.type = o_imm;
-    ida_insn.Op2.dtype = get_dtype_by_size(4);
+    ida_insn.Op2.dtype = dt_word;
     ida_insn.Op2.value = f_16s16;
     ida_insn.Op2.cgen_optype = MEP_OPERAND_SDISP16;
     ida_insn.Op1.type = o_reg;
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RNUS;
+
+    refinfo_t ri;
+    if (get_refinfo(&ri, ida_insn.ea, 1))
+    {
+      ida_insn.Op2.type = o_mem;
+      ida_insn.Op2.addr = calc_reference_target(ida_insn.ea, ri, f_16s16);
+    }
 
     ida_insn.itype = itype;
     ida_insn.size = 4;
@@ -2419,9 +2587,9 @@ int mep_t::mep_ana(insn_t *_insn)
   f_24u8n = ((((f_24u8n_hi) << (8))) | (f_24u8n_lo));
 
     /* Record the operands  */
-    ida_insn.Op2.type = o_mem;
+    ida_insn.Op2.type = o_imm;
     ida_insn.Op2.dtype = get_dtype_by_size(4);
-    ida_insn.Op2.addr = f_24u8n;
+    ida_insn.Op2.value = f_24u8n;
     ida_insn.Op2.cgen_optype = MEP_OPERAND_UIMM24;
     ida_insn.Op1.type = o_reg;
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn3;
@@ -2546,6 +2714,9 @@ int mep_t::mep_ana(insn_t *_insn)
     ida_insn.Op3.dtype = get_dtype_by_size(4);
     ida_insn.Op3.value = f_7u9a4;
     ida_insn.Op3.cgen_optype = MEP_OPERAND_UIMM7A4;
+    ida_insn.Op2.type = o_reg;
+    ida_insn.Op2.reg = REGS_HW_H_GPR_BASE + 15;
+    ida_insn.Op2.cgen_optype = MEP_OPERAND_SPR;
     ida_insn.Op1.type = o_reg;
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RN;
@@ -2841,9 +3012,9 @@ int mep_t::mep_ana(insn_t *_insn)
  extract_sfmt_bra:
   {
     CGEN_INSN_WORD insn = entire_insn;
-    SI f_12s4a2;
+    UINT f_12s4a2;
 
-    f_12s4a2 = ((((EXTRACT_MSB0_SINT (insn, 16, 4, 11)) << (1))) + (pc));
+    f_12s4a2 = (UINT)((((EXTRACT_MSB0_SINT (insn, 16, 4, 11)) << (1))) + (pc));
 
     /* Record the operands  */
     ida_insn.Op1.type = o_near;
@@ -2860,10 +3031,10 @@ int mep_t::mep_ana(insn_t *_insn)
   {
     CGEN_INSN_WORD insn = entire_insn;
     UINT f_rn;
-    SI f_8s8a2;
+    UINT f_8s8a2;
 
     f_rn = EXTRACT_MSB0_UINT (insn, 16, 4, 4);
-    f_8s8a2 = ((((EXTRACT_MSB0_SINT (insn, 16, 8, 7)) << (1))) + (pc));
+    f_8s8a2 = (UINT)((((EXTRACT_MSB0_SINT (insn, 16, 8, 7)) << (1))) + (pc));
 
     /* Record the operands  */
     ida_insn.Op2.type = o_near;
@@ -2884,11 +3055,11 @@ int mep_t::mep_ana(insn_t *_insn)
     CGEN_INSN_WORD insn = entire_insn;
     UINT f_rn;
     UINT f_4u8;
-    SI f_17s16a2;
+    UINT f_17s16a2;
 
     f_rn = EXTRACT_MSB0_UINT (insn, 32, 4, 4);
     f_4u8 = EXTRACT_MSB0_UINT (insn, 32, 8, 4);
-    f_17s16a2 = ((((EXTRACT_MSB0_SINT (insn, 32, 16, 16)) << (1))) + (pc));
+    f_17s16a2 = (UINT)((((EXTRACT_MSB0_SINT (insn, 32, 16, 16)) << (1))) + (pc));
 
     /* Record the operands  */
     ida_insn.Op3.type = o_near;
@@ -2913,11 +3084,11 @@ int mep_t::mep_ana(insn_t *_insn)
     CGEN_INSN_WORD insn = entire_insn;
     UINT f_rn;
     UINT f_rm;
-    SI f_17s16a2;
+    UINT f_17s16a2;
 
     f_rn = EXTRACT_MSB0_UINT (insn, 32, 4, 4);
     f_rm = EXTRACT_MSB0_UINT (insn, 32, 8, 4);
-    f_17s16a2 = ((((EXTRACT_MSB0_SINT (insn, 32, 16, 16)) << (1))) + (pc));
+    f_17s16a2 = (UINT)((((EXTRACT_MSB0_SINT (insn, 32, 16, 16)) << (1))) + (pc));
 
     /* Record the operands  */
     ida_insn.Op3.type = o_near;
@@ -2939,9 +3110,9 @@ int mep_t::mep_ana(insn_t *_insn)
  extract_sfmt_bsr12:
   {
     CGEN_INSN_WORD insn = entire_insn;
-    SI f_12s4a2;
+    UINT f_12s4a2;
 
-    f_12s4a2 = ((((EXTRACT_MSB0_SINT (insn, 16, 4, 11)) << (1))) + (pc));
+    f_12s4a2 = (UINT)((((EXTRACT_MSB0_SINT (insn, 16, 4, 11)) << (1))) + (pc));
 
     /* Record the operands  */
     ida_insn.Op1.type = o_near;
@@ -2959,11 +3130,11 @@ int mep_t::mep_ana(insn_t *_insn)
     CGEN_INSN_WORD insn = entire_insn;
     UINT f_24s5a2n_lo;
     INT f_24s5a2n_hi;
-    INT f_24s5a2n;
+    UINT f_24s5a2n;
 
     f_24s5a2n_lo = EXTRACT_MSB0_UINT (insn, 32, 5, 7);
     f_24s5a2n_hi = EXTRACT_MSB0_SINT (insn, 32, 16, 16);
-  f_24s5a2n = ((((((f_24s5a2n_hi) << (8))) | (((f_24s5a2n_lo) << (1))))) + (pc));
+    f_24s5a2n = (UINT)((((((f_24s5a2n_hi) << (8))) | (((f_24s5a2n_lo) << (1))))) + (pc));
 
     /* Record the operands  */
     ida_insn.Op1.type = o_near;
@@ -3002,12 +3173,12 @@ int mep_t::mep_ana(insn_t *_insn)
 
     f_24u5a2n_lo = EXTRACT_MSB0_UINT (insn, 32, 5, 7);
     f_24u5a2n_hi = EXTRACT_MSB0_UINT (insn, 32, 16, 16);
-  f_24u5a2n = ((((f_24u5a2n_hi) << (8))) | (((f_24u5a2n_lo) << (1))));
+    f_24u5a2n = ((((f_24u5a2n_hi) << (8))) | (((f_24u5a2n_lo) << (1))));
 
     /* Record the operands  */
-    ida_insn.Op1.type = o_mem;
+    ida_insn.Op1.type = o_near;
     ida_insn.Op1.dtype = get_dtype_by_size(4);
-    ida_insn.Op1.addr = f_24u5a2n;
+    ida_insn.Op1.addr = (UINT)((pc & 0xf0000000) | f_24u5a2n);
     ida_insn.Op1.cgen_optype = MEP_OPERAND_PCABS24A2;
 
     ida_insn.itype = itype;
@@ -3047,10 +3218,10 @@ int mep_t::mep_ana(insn_t *_insn)
   {
     CGEN_INSN_WORD insn = entire_insn;
     UINT f_rn;
-    SI f_17s16a2;
+    UINT f_17s16a2;
 
     f_rn = EXTRACT_MSB0_UINT (insn, 32, 4, 4);
-    f_17s16a2 = ((((EXTRACT_MSB0_SINT (insn, 32, 16, 16)) << (1))) + (pc));
+    f_17s16a2 = (UINT)((((EXTRACT_MSB0_SINT (insn, 32, 16, 16)) << (1))) + (pc));
 
     /* Record the operands  */
     ida_insn.Op2.type = o_near;
@@ -3069,9 +3240,9 @@ int mep_t::mep_ana(insn_t *_insn)
  extract_sfmt_erepeat:
   {
     CGEN_INSN_WORD insn = entire_insn;
-    SI f_17s16a2;
+    UINT f_17s16a2;
 
-    f_17s16a2 = ((((EXTRACT_MSB0_SINT (insn, 32, 16, 16)) << (1))) + (pc));
+    f_17s16a2 = (UINT)((((EXTRACT_MSB0_SINT (insn, 32, 16, 16)) << (1))) + (pc));
 
     /* Record the operands  */
     ida_insn.Op1.type = o_near;
@@ -3095,6 +3266,9 @@ int mep_t::mep_ana(insn_t *_insn)
     ida_insn.Op1.type = o_reg;
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RN;
+    ida_insn.Op2.type = o_reg;
+    ida_insn.Op2.reg = REGS_HW_H_CSR_BASE + 1;
+    ida_insn.Op2.cgen_optype = MEP_OPERAND_LP;
 
     ida_insn.itype = itype;
     ida_insn.size = 2;
@@ -3112,6 +3286,9 @@ int mep_t::mep_ana(insn_t *_insn)
     ida_insn.Op1.type = o_reg;
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RN;
+    ida_insn.Op2.type = o_reg;
+    ida_insn.Op2.reg = REGS_HW_H_CSR_BASE + 7;
+    ida_insn.Op2.cgen_optype = MEP_OPERAND_HI;
 
     ida_insn.itype = itype;
     ida_insn.size = 2;
@@ -3129,6 +3306,9 @@ int mep_t::mep_ana(insn_t *_insn)
     ida_insn.Op1.type = o_reg;
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RN;
+    ida_insn.Op2.type = o_reg;
+    ida_insn.Op2.reg = REGS_HW_H_CSR_BASE + 8;
+    ida_insn.Op2.cgen_optype = MEP_OPERAND_LO;
 
     ida_insn.itype = itype;
     ida_insn.size = 2;
@@ -3172,6 +3352,9 @@ int mep_t::mep_ana(insn_t *_insn)
     ida_insn.Op1.type = o_reg;
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RN;
+    ida_insn.Op2.type = o_reg;
+    ida_insn.Op2.reg = REGS_HW_H_CSR_BASE + 1;
+    ida_insn.Op2.cgen_optype = MEP_OPERAND_LP;
 
     ida_insn.itype = itype;
     ida_insn.size = 2;
@@ -3189,6 +3372,9 @@ int mep_t::mep_ana(insn_t *_insn)
     ida_insn.Op1.type = o_reg;
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RN;
+    ida_insn.Op2.type = o_reg;
+    ida_insn.Op2.reg = REGS_HW_H_CSR_BASE + 7;
+    ida_insn.Op2.cgen_optype = MEP_OPERAND_HI;
 
     ida_insn.itype = itype;
     ida_insn.size = 2;
@@ -3206,6 +3392,9 @@ int mep_t::mep_ana(insn_t *_insn)
     ida_insn.Op1.type = o_reg;
     ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rn;
     ida_insn.Op1.cgen_optype = MEP_OPERAND_RN;
+    ida_insn.Op2.type = o_reg;
+    ida_insn.Op2.reg = REGS_HW_H_CSR_BASE + 8;
+    ida_insn.Op2.cgen_optype = MEP_OPERAND_LO;
 
     ida_insn.itype = itype;
     ida_insn.size = 2;
@@ -4426,10 +4615,10 @@ int mep_t::mep_ana(insn_t *_insn)
   {
     CGEN_INSN_WORD insn = entire_insn;
     UINT f_rm;
-    SI f_17s16a2;
+    UINT f_17s16a2;
 
     f_rm = EXTRACT_MSB0_UINT (insn, 32, 8, 4);
-    f_17s16a2 = ((((EXTRACT_MSB0_SINT (insn, 32, 16, 16)) << (1))) + (pc));
+    f_17s16a2 = (UINT)((((EXTRACT_MSB0_SINT (insn, 32, 16, 16)) << (1))) + (pc));
 
     /* Record the operands  */
     ida_insn.Op1.type = o_imm;
@@ -4495,10 +4684,134 @@ int mep_t::mep_ana(insn_t *_insn)
   f_callnum = ((((f_5) << (3))) | (((((f_6) << (2))) | (((((f_7) << (1))) | (f_11))))));
 
     /* Record the operands  */
+    ida_insn.Op1.type = o_imm;
+    ida_insn.Op1.dtype = dt_dword;
+    ida_insn.Op1.value = f_callnum;
+    ida_insn.Op1.cgen_optype = MEP_OPERAND_CALLNUM;
 
     ida_insn.itype = itype;
     ida_insn.size = 2;
     return 2;
+  }
+
+ extract_sfmt_cmov1:
+  {
+    CGEN_INSN_WORD insn = entire_insn;
+    UINT f_crn_lo = EXTRACT_MSB0_UINT (insn, 32, 4, 4);
+    UINT f_rm = EXTRACT_MSB0_UINT (insn, 32, 8, 4);
+    UINT f_crn_hi = EXTRACT_MSB0_UINT (insn, 32, 28, 1);
+    UINT f_crn = (f_crn_hi << 4) | f_crn_lo;
+
+    ida_insn.Op1.type = o_reg;
+    ida_insn.Op1.reg = REGS_HW_H_CR_BASE + f_crn;
+    ida_insn.Op1.cgen_optype = MEP_OPERAND_CRN;
+    ida_insn.Op2.type = o_reg;
+    ida_insn.Op2.reg = REGS_HW_H_GPR_BASE + f_rm;
+    ida_insn.Op2.cgen_optype = MEP_OPERAND_RM;
+
+    ida_insn.itype = itype;
+    ida_insn.size = 4;
+    return 4;
+  }
+
+ extract_sfmt_cmov2:
+  {
+    CGEN_INSN_WORD insn = entire_insn;
+    UINT f_crn_lo = EXTRACT_MSB0_UINT (insn, 32, 4, 4);
+    UINT f_rm = EXTRACT_MSB0_UINT (insn, 32, 8, 4);
+    UINT f_crn_hi = EXTRACT_MSB0_UINT (insn, 32, 28, 1);
+    UINT f_crn = (f_crn_hi << 4) | f_crn_lo;
+
+    ida_insn.Op1.type = o_reg;
+    ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rm;
+    ida_insn.Op1.cgen_optype = MEP_OPERAND_RM;
+    ida_insn.Op2.type = o_reg;
+    ida_insn.Op2.reg = REGS_HW_H_CR_BASE + f_crn;
+    ida_insn.Op2.cgen_optype = MEP_OPERAND_CRN;
+
+    ida_insn.itype = itype;
+    ida_insn.size = 4;
+    return 4;
+  }
+
+ extract_sfmt_cmovc1:
+  {
+    CGEN_INSN_WORD insn = entire_insn;
+    UINT f_ccrn_lo = EXTRACT_MSB0_UINT (insn, 32, 4, 4);
+    UINT f_rm = EXTRACT_MSB0_UINT (insn, 32, 8, 4);
+    UINT f_ccrn_hi = EXTRACT_MSB0_UINT (insn, 32, 28, 2);
+    UINT f_ccrn = (f_ccrn_hi << 4) | f_ccrn_lo;
+
+    ida_insn.Op1.type = o_reg;
+    ida_insn.Op1.reg = REGS_HW_H_CCR_BASE + f_ccrn;
+    ida_insn.Op1.cgen_optype = MEP_OPERAND_CCRN;
+    ida_insn.Op2.type = o_reg;
+    ida_insn.Op2.reg = REGS_HW_H_GPR_BASE + f_rm;
+    ida_insn.Op2.cgen_optype = MEP_OPERAND_RM;
+
+    ida_insn.itype = itype;
+    ida_insn.size = 4;
+    return 4;
+  }
+
+ extract_sfmt_cmovc2:
+  {
+    CGEN_INSN_WORD insn = entire_insn;
+    UINT f_ccrn_lo = EXTRACT_MSB0_UINT (insn, 32, 4, 4);
+    UINT f_rm = EXTRACT_MSB0_UINT (insn, 32, 8, 4);
+    UINT f_ccrn_hi = EXTRACT_MSB0_UINT (insn, 32, 28, 2);
+    UINT f_ccrn = (f_ccrn_hi << 4) | f_ccrn_lo;
+
+    ida_insn.Op1.type = o_reg;
+    ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rm;
+    ida_insn.Op1.cgen_optype = MEP_OPERAND_RM;
+    ida_insn.Op2.type = o_reg;
+    ida_insn.Op2.reg = REGS_HW_H_CCR_BASE + f_ccrn;
+    ida_insn.Op2.cgen_optype = MEP_OPERAND_CCRN;
+
+    ida_insn.itype = itype;
+    ida_insn.size = 4;
+    return 4;
+  }
+
+ extract_sfmt_cmovh1:
+  {
+    CGEN_INSN_WORD insn = entire_insn;
+    UINT f_crn_lo = EXTRACT_MSB0_UINT (insn, 32, 4, 4);
+    UINT f_rm = EXTRACT_MSB0_UINT (insn, 32, 8, 4);
+    UINT f_crn_hi = EXTRACT_MSB0_UINT (insn, 32, 28, 1);
+    UINT f_crn = (f_crn_hi << 4) | f_crn_lo;
+
+    ida_insn.Op1.type = o_reg;
+    ida_insn.Op1.reg = REGS_HW_H_CR64_BASE + f_crn;
+    ida_insn.Op1.cgen_optype = MEP_OPERAND_CRN64;
+    ida_insn.Op2.type = o_reg;
+    ida_insn.Op2.reg = REGS_HW_H_GPR_BASE + f_rm;
+    ida_insn.Op2.cgen_optype = MEP_OPERAND_RM;
+
+    ida_insn.itype = itype;
+    ida_insn.size = 4;
+    return 4;
+  }
+
+ extract_sfmt_cmovh2:
+  {
+    CGEN_INSN_WORD insn = entire_insn;
+    UINT f_crn_lo = EXTRACT_MSB0_UINT (insn, 32, 4, 4);
+    UINT f_rm = EXTRACT_MSB0_UINT (insn, 32, 8, 4);
+    UINT f_crn_hi = EXTRACT_MSB0_UINT (insn, 32, 28, 1);
+    UINT f_crn = (f_crn_hi << 4) | f_crn_lo;
+
+    ida_insn.Op1.type = o_reg;
+    ida_insn.Op1.reg = REGS_HW_H_GPR_BASE + f_rm;
+    ida_insn.Op1.cgen_optype = MEP_OPERAND_RM;
+    ida_insn.Op2.type = o_reg;
+    ida_insn.Op2.reg = REGS_HW_H_CR64_BASE + f_crn;
+    ida_insn.Op2.cgen_optype = MEP_OPERAND_CRN64;
+
+    ida_insn.itype = itype;
+    ida_insn.size = 4;
+    return 4;
   }
 
 }

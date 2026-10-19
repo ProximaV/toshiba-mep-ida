@@ -46,7 +46,7 @@ instruc_t Instructions[] = {
   { "lhucpm0",    CF_USE2|CF_USE3|CF_CHG1|CF_CHG2 }, //lhucpm0 $crn,($rma+),$cdisp10a2
   { "lbucpm1",    CF_USE2|CF_USE3|CF_CHG1|CF_CHG2 }, //lbucpm1 $crn,($rma+),$cdisp10
   { "lhucpm1",    CF_USE2|CF_USE3|CF_CHG1|CF_CHG2 }, //lhucpm1 $crn,($rma+),$cdisp10a2
-  { "uci",    CF_USE1|CF_USE2|CF_CHG1 }, //uci $rn,$rm,$uimm16
+  { "uci",    CF_USE1|CF_USE2|CF_USE3|CF_CHG1 }, //uci $rn,$rm,$uimm16
   { "dsp",    CF_USE1|CF_USE2|CF_USE3|CF_CHG1 }, //dsp $rn,$rm,$uimm16
   { "dsp0",    CF_USE1 }, //dsp0 $c5rnmuimm24
   { "dsp1",    CF_USE1|CF_USE2|CF_CHG1 }, //dsp1 $rn,$c5rmuimm20
@@ -58,16 +58,16 @@ instruc_t Instructions[] = {
   { "lw",    CF_USE2|CF_CHG1 }, //lw $rnl,($rma)
   { "lbu",    CF_USE2|CF_CHG1 }, //lbu $rnuc,($rma)
   { "lhu",    CF_USE2|CF_CHG1 }, //lhu $rnus,($rma)
-  { "sw",    CF_USE1|CF_USE2 }, //sw $rnl,$udisp7a4($spr)
-  { "lw",    CF_USE2|CF_CHG1 }, //lw $rnl,$udisp7a4($spr)
-  { "sb",    CF_USE1|CF_USE2 }, //sb $rn3c,$udisp7($tpr)
-  { "sh",    CF_USE1|CF_USE2 }, //sh $rn3s,$udisp7a2($tpr)
-  { "sw",    CF_USE1|CF_USE2 }, //sw $rn3l,$udisp7a4($tpr)
-  { "lb",    CF_USE2|CF_CHG1 }, //lb $rn3c,$udisp7($tpr)
-  { "lh",    CF_USE2|CF_CHG1 }, //lh $rn3s,$udisp7a2($tpr)
-  { "lw",    CF_USE2|CF_CHG1 }, //lw $rn3l,$udisp7a4($tpr)
-  { "lbu",    CF_USE2|CF_CHG1 }, //lbu $rn3uc,$udisp7($tpr)
-  { "lhu",    CF_USE2|CF_CHG1 }, //lhu $rn3us,$udisp7a2($tpr)
+  { "sw",    CF_USE1|CF_USE2|CF_USE3 }, //sw $rnl,$udisp7a4($spr)
+  { "lw",    CF_USE2|CF_USE3|CF_CHG1 }, //lw $rnl,$udisp7a4($spr)
+  { "sb",    CF_USE1|CF_USE2|CF_USE3 }, //sb $rn3c,$udisp7($tpr)
+  { "sh",    CF_USE1|CF_USE2|CF_USE3 }, //sh $rn3s,$udisp7a2($tpr)
+  { "sw",    CF_USE1|CF_USE2|CF_USE3 }, //sw $rn3l,$udisp7a4($tpr)
+  { "lb",    CF_USE2|CF_USE3|CF_CHG1 }, //lb $rn3c,$udisp7($tpr)
+  { "lh",    CF_USE2|CF_USE3|CF_CHG1 }, //lh $rn3s,$udisp7a2($tpr)
+  { "lw",    CF_USE2|CF_USE3|CF_CHG1 }, //lw $rn3l,$udisp7a4($tpr)
+  { "lbu",    CF_USE2|CF_USE3|CF_CHG1 }, //lbu $rn3uc,$udisp7($tpr)
+  { "lhu",    CF_USE2|CF_USE3|CF_CHG1 }, //lhu $rn3us,$udisp7a2($tpr)
   { "sb",    CF_USE1|CF_USE3|CF_USE2 }, //sb $rnc,$sdisp16($rma)
   { "sh",    CF_USE1|CF_USE3|CF_USE2 }, //sh $rns,$sdisp16($rma)
   { "sw",    CF_USE1|CF_USE3|CF_USE2 }, //sw $rnl,$sdisp16($rma)
@@ -91,7 +91,7 @@ instruc_t Instructions[] = {
   { "movh",    CF_USE2|CF_CHG1 }, //movh $rn,$uimm16
   { "add3",    CF_USE2|CF_USE3|CF_CHG1 }, //add3 $rl,$rn,$rm
   { "add",    CF_USE1|CF_USE2|CF_CHG1 }, //add $rn,$simm6
-  { "add3",    CF_USE3|CF_CHG1 }, //add3 $rn,$spr,$uimm7a4
+  { "add3",    CF_USE2|CF_USE3|CF_CHG1 }, //add3 $rn,$spr,$uimm7a4
   { "advck3",    CF_USE1|CF_USE2 }, //advck3 \$0,$rn,$rm
   { "sub",    CF_USE1|CF_USE2|CF_CHG1 }, //sub $rn,$rm
   { "sbvck3",    CF_USE1|CF_USE2 }, //sbvck3 \$0,$rn,$rm
@@ -112,13 +112,13 @@ instruc_t Instructions[] = {
   { "or3",    CF_USE2|CF_USE3|CF_CHG1 }, //or3 $rn,$rm,$uimm16
   { "and3",    CF_USE2|CF_USE3|CF_CHG1 }, //and3 $rn,$rm,$uimm16
   { "xor3",    CF_USE2|CF_USE3|CF_CHG1 }, //xor3 $rn,$rm,$uimm16
-  { "sra",    CF_USE1|CF_USE2|CF_CHG1 }, //sra $rn,$rm
-  { "srl",    CF_USE1|CF_USE2|CF_CHG1 }, //srl $rn,$rm
-  { "sll",    CF_USE1|CF_USE2|CF_CHG1 }, //sll $rn,$rm
-  { "sra",    CF_USE1|CF_USE2|CF_CHG1 }, //sra $rn,$uimm5
-  { "srl",    CF_USE1|CF_USE2|CF_CHG1 }, //srl $rn,$uimm5
-  { "sll",    CF_USE1|CF_USE2|CF_CHG1 }, //sll $rn,$uimm5
-  { "sll3",    CF_USE1|CF_USE2 }, //sll3 \$0,$rn,$uimm5
+  { "sra",    CF_USE1|CF_USE2|CF_CHG1|CF_SHFT }, //sra $rn,$rm
+  { "srl",    CF_USE1|CF_USE2|CF_CHG1|CF_SHFT }, //srl $rn,$rm
+  { "sll",    CF_USE1|CF_USE2|CF_CHG1|CF_SHFT }, //sll $rn,$rm
+  { "sra",    CF_USE1|CF_USE2|CF_CHG1|CF_SHFT }, //sra $rn,$uimm5
+  { "srl",    CF_USE1|CF_USE2|CF_CHG1|CF_SHFT }, //srl $rn,$uimm5
+  { "sll",    CF_USE1|CF_USE2|CF_CHG1|CF_SHFT }, //sll $rn,$uimm5
+  { "sll3",    CF_USE1|CF_USE2|CF_SHFT }, //sll3 \$0,$rn,$uimm5
   { "fsft",    CF_USE1|CF_USE2|CF_CHG1 }, //fsft $rn,$rm
   { "bra",    CF_USE1|CF_STOP }, //bra $pcrel12a2
   { "beqz",    CF_USE1|CF_USE2 }, //beqz $rn,$pcrel8a2
@@ -131,24 +131,24 @@ instruc_t Instructions[] = {
   { "bne",    CF_USE1|CF_USE2|CF_USE3 }, //bne $rn,$rm,$pcrel17a2
   { "bsr",    CF_CALL|CF_USE1 }, //bsr $pcrel12a2
   { "bsr",    CF_CALL|CF_USE1 }, //bsr $pcrel24a2
-  { "jmp",    CF_CALL|CF_STOP|CF_USE1 | CF_JUMP }, //jmp $rm
-  { "jmp",    CF_CALL|CF_STOP|CF_USE1 }, //jmp $pcabs24a2
-  { "jsr",    CF_CALL|CF_USE1 }, //jsr $rm
+  { "jmp",    CF_STOP|CF_USE1|CF_JUMP }, //jmp $rm
+  { "jmp",    CF_STOP|CF_USE1 }, //jmp $pcabs24a2
+  { "jsr",    CF_CALL|CF_USE1|CF_JUMP }, //jsr $rm
   { "ret",    CF_STOP }, //ret
   { "repeat",    CF_USE1|CF_USE2 }, //repeat $rn,$pcrel17a2
   { "erepeat",    CF_USE1 }, //erepeat $pcrel17a2
-  { "stc",    CF_USE1 }, //stc $rn,\$lp
-  { "stc",    CF_USE1 }, //stc $rn,\$hi
-  { "stc",    CF_USE1 }, //stc $rn,\$lo
+  { "stc",    CF_USE1|CF_CHG2 }, //stc $rn,\$lp
+  { "stc",    CF_USE1|CF_CHG2 }, //stc $rn,\$hi
+  { "stc",    CF_USE1|CF_CHG2 }, //stc $rn,\$lo
   { "stc",    CF_USE1|CF_CHG2 }, //stc $rn,$csrn
-  { "ldc",    CF_CHG1 }, //ldc $rn,\$lp
-  { "ldc",    CF_CHG1 }, //ldc $rn,\$hi
-  { "ldc",    CF_CHG1 }, //ldc $rn,\$lo
+  { "ldc",    CF_USE2|CF_CHG1 }, //ldc $rn,\$lp
+  { "ldc",    CF_USE2|CF_CHG1 }, //ldc $rn,\$hi
+  { "ldc",    CF_USE2|CF_CHG1 }, //ldc $rn,\$lo
   { "ldc",    CF_USE2|CF_CHG1 }, //ldc $rn,$csrn
   { "di",    0 }, //di
   { "ei",    0 }, //ei
   { "reti",    CF_STOP }, //reti
-  { "halt",    0 }, //halt
+  { "halt",    CF_STOP }, //halt
   { "sleep",    0 }, //sleep
   { "swi",    CF_USE1 }, //swi $uimm2
   { "break",    0 }, //break
@@ -227,10 +227,10 @@ instruc_t Instructions[] = {
   { "bcpat",    CF_USE1|CF_USE2 }, //bcpat $cccc,$pcrel17a2
   { "bcpaf",    CF_USE1|CF_USE2 }, //bcpaf $cccc,$pcrel17a2
   { "synccp",    0 }, //synccp
-  { "jsrv",    CF_CALL|CF_USE1 }, //jsrv $rm
+  { "jsrv",    CF_CALL|CF_USE1|CF_JUMP }, //jsrv $rm
   { "bsrv",    CF_CALL|CF_USE1 }, //bsrv $pcrel24a2
   { "cp",    CF_USE1 }, //cp $code24
-  { "--syscall--",     }, //--syscall--
+  { "--syscall--",    0 }, //--syscall--
   { "--reserved--",    0 }, //--reserved--
   { "--reserved--",    0 }, //--reserved--
   { "--reserved--",    0 }, //--reserved--
@@ -253,4 +253,10 @@ instruc_t Instructions[] = {
   { "--reserved--",    0 }, //--reserved--
   { "--reserved--",    0 }, //--reserved--
   { "--reserved--",    0 }, //--reserved--
+  { "cmov",    CF_USE2|CF_CHG1 }, //cmov $crn,$rm
+  { "cmov",    CF_USE2|CF_CHG1 }, //cmov $rm,$crn
+  { "cmovc",    CF_USE2|CF_CHG1 }, //cmovc $ccrn,$rm
+  { "cmovc",    CF_USE2|CF_CHG1 }, //cmovc $rm,$ccrn
+  { "cmovh",    CF_USE2|CF_CHG1 }, //cmovh $crn64,$rm
+  { "cmovh",    CF_USE2|CF_CHG1 }, //cmovh $rm,$crn64
 };

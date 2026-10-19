@@ -39,7 +39,6 @@ This file is part of the GNU Binutils and/or GDB, the GNU debugger.
 #include <kernwin.hpp>
 #include <frame.hpp>
 #include "ins.hpp"
-#include "mep.hpp"
 #include "../idaidp.hpp"
 
 /*
@@ -84,6 +83,52 @@ bool idaapi out_opnd(outctx_t &ctx, const op_t &x);
 #define REGS_HW_H_CR_IVC2_BASE 273
 #define REGS_HW_H_CCR_IVC2_BASE 337
 #define REGS_COUNT 369
+
+enum mep_reg_t
+{
+  MEP_REG_R0  = REGS_HW_H_GPR_BASE + 0,
+  MEP_REG_R1  = REGS_HW_H_GPR_BASE + 1,
+  MEP_REG_R2  = REGS_HW_H_GPR_BASE + 2,
+  MEP_REG_R3  = REGS_HW_H_GPR_BASE + 3,
+  MEP_REG_R4  = REGS_HW_H_GPR_BASE + 4,
+  MEP_REG_R5  = REGS_HW_H_GPR_BASE + 5,
+  MEP_REG_R6  = REGS_HW_H_GPR_BASE + 6,
+  MEP_REG_R7  = REGS_HW_H_GPR_BASE + 7,
+  MEP_REG_R8  = REGS_HW_H_GPR_BASE + 8,
+  MEP_REG_FP  = REGS_HW_H_GPR_BASE + 8,  // $8 is $fp in MeP ABI
+  MEP_REG_R9  = REGS_HW_H_GPR_BASE + 9,
+  MEP_REG_R10 = REGS_HW_H_GPR_BASE + 10,
+  MEP_REG_R11 = REGS_HW_H_GPR_BASE + 11,
+  MEP_REG_R12 = REGS_HW_H_GPR_BASE + 12,
+  MEP_REG_TP  = REGS_HW_H_GPR_BASE + 13, // $13 / $tp (Tiny Data Pointer)
+  MEP_REG_GP  = REGS_HW_H_GPR_BASE + 14, // $14 / $gp (Global/Small Data Pointer)
+  MEP_REG_SP  = REGS_HW_H_GPR_BASE + 15, // $15 / $sp (Stack Pointer)
+
+  MEP_REG_PC   = REGS_HW_H_CSR_BASE + 0,
+  MEP_REG_LP   = REGS_HW_H_CSR_BASE + 1,
+  MEP_REG_SAR  = REGS_HW_H_CSR_BASE + 2,
+  MEP_REG_RPB  = REGS_HW_H_CSR_BASE + 4,
+  MEP_REG_RPE  = REGS_HW_H_CSR_BASE + 5,
+  MEP_REG_RPC  = REGS_HW_H_CSR_BASE + 6,
+  MEP_REG_HI   = REGS_HW_H_CSR_BASE + 7,
+  MEP_REG_LO   = REGS_HW_H_CSR_BASE + 8,
+  MEP_REG_MB0  = REGS_HW_H_CSR_BASE + 11,
+  MEP_REG_ME0  = REGS_HW_H_CSR_BASE + 12,
+  MEP_REG_MB1  = REGS_HW_H_CSR_BASE + 13,
+  MEP_REG_ME1  = REGS_HW_H_CSR_BASE + 14,
+  MEP_REG_PSW  = REGS_HW_H_CSR_BASE + 15,
+  MEP_REG_ID   = REGS_HW_H_CSR_BASE + 16,
+  MEP_REG_TMP  = REGS_HW_H_CSR_BASE + 17,
+  MEP_REG_EPC  = REGS_HW_H_CSR_BASE + 18,
+  MEP_REG_EXC  = REGS_HW_H_CSR_BASE + 19,
+  MEP_REG_CFG  = REGS_HW_H_CSR_BASE + 20,
+  MEP_REG_NPC  = REGS_HW_H_CSR_BASE + 22,
+  MEP_REG_DBG  = REGS_HW_H_CSR_BASE + 23,
+  MEP_REG_DEPC = REGS_HW_H_CSR_BASE + 24,
+  MEP_REG_OPT  = REGS_HW_H_CSR_BASE + 25,
+  MEP_REG_RCFG = REGS_HW_H_CSR_BASE + 26,
+  MEP_REG_CCFG = REGS_HW_H_CSR_BASE + 27,
+};
 /* Hardware attribute indices.  */
 
 /* Enum declaration for cgen_hw attrs.  */
@@ -189,22 +234,28 @@ typedef enum cgen_operand_type {
 
 /* IDP exports */
 
-//int  idaapi mep_ana(insn_t *_insn);
-//int  idaapi mep_emu(const insn_t &insn);
-
-
 DECLARE_PROC_LISTENER(idb_listener_t, struct mep_t);
 
 struct mep_t : public procmod_t
 {
+    netnode helper;
     idb_listener_t idb_listener = idb_listener_t(*this);
-    
+
     virtual ssize_t idaapi on_event(ssize_t msgid, va_list va) override;
-    bool mep_is_switch(switch_info_t* si, const insn_t& insn);
-    int mep_ana(insn_t* _insn);
-    int mep_emu(const insn_t& insn);
+    bool mep_is_switch(switch_info_t *si, const insn_t &insn);
+    int mep_ana(insn_t *_insn);
+    int mep_emu(const insn_t &insn);
+
+    bool find_reg_value(ea_t ea, int reg, uval_t *p_val, ea_t *p_movh_ea = nullptr, int max_steps = 32);
+    void trace_sp(ea_t func_ea, const insn_t &insn);
+    bool create_func_frame(ea_t func_ea);
+    int is_sp_based(const insn_t &insn, const op_t &op) const;
+
+    void set_repeat_loop(ea_t tail_ea, ea_t rpb_ea, bool is_erepeat);
+    bool get_repeat_loop(ea_t tail_ea, ea_t *p_rpb_ea, bool *p_is_erepeat) const;
 };
 
 extern int data_id;
 
 #endif
+
