@@ -237,20 +237,183 @@ bool mep_t::mep_is_switch(switch_info_t *si, const insn_t &insn)
   if ( insn.itype != MEP_INSN_JMP || insn.Op1.type != o_reg )
     return false;
 
-  // Match pattern:
+  int jump_reg = insn.Op1.reg;
+  insn_t prev;
+  if ( decode_prev_insn(&prev, insn.ea) == BADADDR )
+    return false;
+
+  //--------------------------------------------------------------------
+  // Pattern A: Absolute 32-bit pointer table (used in F00D ROM):
+  //   mov     $max, #(ncases - 1)
+  //   [add    $idx, #-lowcase]
+  //   sltu3   $0, $max, $idx
+  //   bnei    $0, 0, default_label
+  //   movu24  $tbl, #jt_addr        (or movh + add3x/or3)
+  //   sll     $idx, 2
+  //   add3    $ptr, $tbl, $idx      (or hoisted to stack slot disp($sp))
+  //   lw      $rm, ($ptr)
+  //   jmp     $rm
+  //--------------------------------------------------------------------
+  if ( prev.itype == MEP_INSN_LW && prev.Op1.reg == jump_reg )
+  {
+    int ptr_reg = prev.Op2.reg;
+    ea_t scan_ea = prev.ea;
+    ea_t jt_addr = BADADDR;
+    int idx_reg = -1;
+    int ncases = 0;
+    int lowcase = 0;
+    ea_t defjump = BADADDR;
+    ea_t startea = prev.ea;
+    sval_t sp_ptr_disp = -1;
+    sval_t sp_cond_disp = -1;
+    int cond_reg = MEP_REG_R0;
+
+    for ( int step = 0; step < 32 && scan_ea != BADADDR; ++step )
+    {
+      insn_t cur;
+      if ( decode_prev_insn(&cur, scan_ea) == BADADDR )
+        break;
+      scan_ea = cur.ea;
+
+      // Check if ptr_reg was loaded from a stack spill slot `lw $ptr, disp($sp)`
+      if ( cur.itype == MEP_INSN_LW_SP && cur.Op1.reg == ptr_reg && sp_ptr_disp < 0 )
+      {
+        sp_ptr_disp = (sval_t)cur.Op2.value;
+        continue;
+      }
+      // Match the corresponding `sw $r, disp($sp)` in a loop preheader
+      if ( cur.itype == MEP_INSN_SW_SP && sp_ptr_disp >= 0 && (sval_t)cur.Op2.value == sp_ptr_disp )
+      {
+        ptr_reg = cur.Op1.reg;
+        sp_ptr_disp = -1;
+        continue;
+      }
+      if ( cur.itype == MEP_INSN_SW_SP && sp_cond_disp >= 0 && (sval_t)cur.Op2.value == sp_cond_disp )
+      {
+        cond_reg = cur.Op1.reg;
+        sp_cond_disp = -1;
+        continue;
+      }
+
+      // Match `add3 $ptr, $tbl, $scaled_idx`
+      if ( cur.itype == MEP_INSN_ADD3 && cur.Op1.reg == ptr_reg && jt_addr == BADADDR )
+      {
+        int rA = cur.Op2.reg;
+        int rB = cur.Op3.reg;
+        uval_t val = 0;
+        if ( find_reg_value(cur.ea, rA, &val) && is_mapped((ea_t)val) )
+        {
+          jt_addr = (ea_t)val;
+          idx_reg = rB;
+        }
+        else if ( find_reg_value(cur.ea, rB, &val) && is_mapped((ea_t)val) )
+        {
+          jt_addr = (ea_t)val;
+          idx_reg = rA;
+        }
+        continue;
+      }
+
+      // Match `sll $idx, 2` or `sll3 $0, $idx, 2`
+      if ( cur.itype == MEP_INSN_SLLI && cur.Op1.reg == idx_reg && cur.Op2.value == 2 )
+      {
+        startea = cur.ea;
+        continue;
+      }
+      if ( cur.itype == MEP_INSN_SLL3 && cur.Op1.reg == idx_reg && cur.Op3.value == 2 )
+      {
+        idx_reg = cur.Op2.reg;
+        startea = cur.ea;
+        continue;
+      }
+
+      // Match bounds branch `bnei $cond, 0, defjump` or `bnez $cond, defjump`
+      if ( defjump == BADADDR )
+      {
+        if ( cur.itype == MEP_INSN_BNEI && cur.Op2.value == 0 )
+        {
+          cond_reg = cur.Op1.reg;
+          defjump = cur.Op3.addr;
+          continue;
+        }
+        if ( cur.itype == MEP_INSN_BNEZ )
+        {
+          cond_reg = cur.Op1.reg;
+          defjump = cur.Op2.addr;
+          continue;
+        }
+      }
+
+      if ( cur.itype == MEP_INSN_LW_SP && cur.Op1.reg == cond_reg && sp_cond_disp < 0 )
+      {
+        sp_cond_disp = (sval_t)cur.Op2.value;
+        continue;
+      }
+
+      // Match bounds compare `sltu3 $0, $max_reg, $idx_reg`
+      if ( cur.itype == MEP_INSN_SLTU3 && ncases == 0 )
+      {
+        uval_t max_val = 0;
+        if ( find_reg_value(cur.ea, cur.Op2.reg, &max_val) && max_val < 256 )
+        {
+          ncases = (int)max_val + 1;
+          if ( idx_reg < 0 )
+            idx_reg = cur.Op3.reg;
+          startea = cur.ea;
+        }
+        continue;
+      }
+      if ( cur.itype == MEP_INSN_SLTU3I && ncases == 0 && cur.Op3.type == o_imm )
+      {
+        if ( cur.Op3.value > 0 && cur.Op3.value <= 256 )
+        {
+          ncases = (int)cur.Op3.value;
+          if ( idx_reg < 0 )
+            idx_reg = cur.Op2.reg;
+          startea = cur.ea;
+        }
+        continue;
+      }
+
+      // Match index bias `add $idx, -lowcase`
+      if ( cur.itype == MEP_INSN_ADD && cur.Op1.reg == idx_reg && cur.Op2.type == o_imm && ncases > 0 )
+      {
+        lowcase = -(int)(int32)cur.Op2.value;
+        startea = cur.ea;
+        break;
+      }
+      if ( ncases > 0 && jt_addr != BADADDR && step > 10 )
+        break;
+    }
+
+    if ( jt_addr != BADADDR && ncases > 0 && idx_reg >= 0 )
+    {
+      si->flags = SWI_J32 | SWI_V32;
+      si->ncases = ushort(ncases);
+      si->jumps = jt_addr;
+      si->lowcase = lowcase;
+      si->startea = startea;
+      if ( defjump != BADADDR )
+      {
+        si->defjump = defjump;
+      }
+      si->set_expr(idx_reg, dt_dword);
+      return true;
+    }
+    return false;
+  }
+
+  //--------------------------------------------------------------------
+  // Pattern B: Relative offset table:
   //   sl2ad3  $0, $idx, $base
   //   movu24  $tmp, #jt_addr   (or movh + add3 / or3)
   //   lh / lw $rm, ($0)
   //   add     $rm, $tmp
   //   jmp     $rm
-  insn_t prev;
-  if ( decode_prev_insn(&prev, insn.ea) == BADADDR )
-    return false;
-
+  //--------------------------------------------------------------------
   if ( prev.itype != MEP_INSN_ADD )
     return false;
 
-  int jump_reg = insn.Op1.reg;
   if ( prev.Op1.reg != jump_reg )
     return false;
   int jt_addr_reg = prev.Op2.reg;
@@ -369,7 +532,9 @@ bool mep_t::mep_is_switch(switch_info_t *si, const insn_t &insn)
   si->lowcase = lowcase;
   si->startea = startea;
   if ( defjump != BADADDR )
+  {
     si->defjump = defjump;
+  }
   si->set_expr(idx_reg, dt_dword);
   return true;
 }
@@ -424,14 +589,19 @@ bool mep_t::create_func_frame(ea_t func_ea)
   sval_t frsize = 0;
   ushort regsize = 0;
   bool uses_fp = false;
+  int lp_carrier_reg = -1;
 
-  for ( int i = 0; i < 10; ++i )
+  for ( int i = 0; i < 16; ++i )
   {
     insn_t insn;
     if ( decode_insn(&insn, ea) == 0 )
       break;
 
-    if ( insn.itype == MEP_INSN_ADD
+    if ( insn.itype == MEP_INSN_LDC_LP && insn.Op1.type == o_reg )
+    {
+      lp_carrier_reg = insn.Op1.reg;
+    }
+    else if ( insn.itype == MEP_INSN_ADD
       && insn.Op1.reg == MEP_REG_SP
       && insn.Op2.type == o_imm
       && (int32)insn.Op2.value < 0 )
@@ -447,9 +617,12 @@ bool mep_t::create_func_frame(ea_t func_ea)
       frsize += -(int16)insn.Op3.value;
     }
     else if ( (insn.itype == MEP_INSN_SW_SP || (insn.itype == MEP_INSN_SW16 && insn.Op3.reg == MEP_REG_SP))
-           && (insn.Op1.reg == MEP_REG_LP || insn.Op1.reg == MEP_REG_FP || (insn.Op1.reg >= MEP_REG_R5 && insn.Op1.reg <= MEP_REG_R12)) )
+           && (insn.Op1.reg == MEP_REG_LP || insn.Op1.reg == lp_carrier_reg
+               || insn.Op1.reg == MEP_REG_FP || (insn.Op1.reg >= MEP_REG_R5 && insn.Op1.reg <= MEP_REG_R12)) )
     {
       regsize += 4;
+      if ( insn.Op1.reg == lp_carrier_reg )
+        lp_carrier_reg = -1;
     }
     else if ( (insn.itype == MEP_INSN_MOV && insn.Op1.reg == MEP_REG_FP && insn.Op2.reg == MEP_REG_SP)
            || (insn.itype == MEP_INSN_ADD3I && insn.Op1.reg == MEP_REG_FP && insn.Op2.reg == MEP_REG_SP) )
@@ -474,6 +647,7 @@ bool mep_t::create_func_frame(ea_t func_ea)
   set_func_flag(func_ea, flags);
   return add_frame_ea(func_ea, frsize - regsize, regsize, 0);
 }
+
 
 int mep_t::is_sp_based(const insn_t &insn, const op_t & /*op*/) const
 {
@@ -603,13 +777,56 @@ int mep_t::mep_emu(const insn_t &insn)
       {
         flow = false;
         switch_info_t si;
-        if ( get_switch_info(&si, insn.ea) <= 0 )
+        bool has_switch = (get_switch_info(&si, insn.ea) > 0);
+        if ( !has_switch && mep_is_switch(&si, insn) )
+        {
+          set_switch_info(insn.ea, si);
+          has_switch = true;
+        }
+        if ( has_switch )
+        {
+          create_switch_table(insn.ea, si);
+        }
+        else
         {
           uval_t target = 0;
           if ( find_reg_value(insn.ea, insn.Op1.reg, &target) && is_mapped(target & ~uval_t(1)) )
+          {
             insn.add_cref(target & ~uval_t(1), insn.Op1.offb, fl_JN);
+          }
           else
-            remember_problem(PR_JUMP, insn.ea);
+          {
+            bool is_epilogue_ret = false;
+            ea_t cur = insn.ea;
+            for ( int step = 0; step < 6; ++step )
+            {
+              insn_t prev;
+              cur = prev_not_tail(cur);
+              if ( cur == BADADDR || decode_insn(&prev, cur) <= 0 )
+                break;
+              if ( prev.itype == MEP_INSN_LDC
+                && prev.Op1.reg == insn.Op1.reg
+                && prev.Op2.reg == MEP_REG_LP )
+              {
+                is_epilogue_ret = true;
+                break;
+              }
+              if ( (prev.itype == MEP_INSN_ADD && prev.Op1.reg == MEP_REG_SP && (int32)prev.Op2.value > 0)
+                || ((prev.itype == MEP_INSN_ADD3I || prev.itype == MEP_INSN_ADD3X)
+                 && prev.Op1.reg == MEP_REG_SP
+                 && prev.Op2.reg == MEP_REG_SP
+                 && (int32)(int16)prev.Op3.value > 0) )
+              {
+                is_epilogue_ret = true;
+                break;
+              }
+              uint32 pfeat = prev.get_canon_feature(ph);
+              if ( (pfeat & CF_CHG1) != 0 && prev.Op1.type == o_reg && prev.Op1.reg == insn.Op1.reg )
+                break;
+            }
+            if ( !is_epilogue_ret )
+              remember_problem(PR_JUMP, insn.ea);
+          }
         }
       }
       break;
@@ -678,10 +895,8 @@ int mep_t::mep_emu(const insn_t &insn)
     // Per MeP-c4 Spec (p. 158, 199):
     //   rpb <- PC + 4
     //   rpe <- target & ~1  (or | 1 for erepeat)
-    // When PC[31:1] == rpe[31:1], hardware branches back to rpb.
-    // Note: Some assemblers encode rpe_target as the label immediately
-    // following the last loop instruction; if rpe_target is an unconditional
-    // return/jump or outside the loop, also check the preceding instruction.
+    // When PC[31:1] == rpe[31:1], hardware triggers the loop back-edge and
+    // branches to rpb after executing the instruction immediately following rpe.
     //------------------------------------------------------------------
     case MEP_INSN_REPEAT:
     case MEP_INSN_EREPEAT:
@@ -696,11 +911,9 @@ int mep_t::mep_emu(const insn_t &insn)
         insn.add_dref(rpe_ea, targ_op.offb, dr_O);
 
         // Determine the loop tail instruction:
-        // Per the MeP architecture specification, RPE is the address of the
-        // last instruction in the loop body, which cannot be a branch/ret.
-        // However, if a toolchain emitted RPE as the address just past the
-        // last loop instruction (e.g. pointing to a `ret` or `bra`), fall
-        // back to the preceding instruction.
+        // In MeP hardware, when PC == RPE, the instruction immediately following
+        // RPE executes as the final instruction of the loop iteration before
+        // branching back to RPB.
         ea_t tail_ea = rpe_ea;
         insn_t rpe_insn;
         if ( decode_insn(&rpe_insn, rpe_ea) > 0 )
@@ -711,6 +924,23 @@ int mep_t::mep_emu(const insn_t &insn)
             ea_t prev_ea = prev_not_tail(rpe_ea);
             if ( prev_ea != BADADDR && prev_ea >= rpb_ea )
               tail_ea = prev_ea;
+          }
+          else
+          {
+            ea_t next_ea = rpe_ea + rpe_insn.size;
+            insn_t next_insn;
+            if ( decode_insn(&next_insn, next_ea) > 0 )
+            {
+              uint32 next_feat = next_insn.get_canon_feature(ph);
+              if ( (next_feat & CF_STOP) == 0
+                && next_insn.itype != MEP_INSN_BRA
+                && next_insn.itype != MEP_INSN_JMP
+                && next_insn.itype != MEP_INSN_JMP24
+                && next_insn.itype != MEP_INSN_RET )
+              {
+                tail_ea = next_ea;
+              }
+            }
           }
         }
 
