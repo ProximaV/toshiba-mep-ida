@@ -7,6 +7,44 @@
 
 #pragma warning ( disable : 4146 )
 #include "mep.hpp"
+#include <funcs.hpp>
+
+static inline ea_t get_func_start(ea_t ea)
+{
+  func_t *pfn = get_func(ea);
+  return pfn != nullptr ? pfn->start_ea : BADADDR;
+}
+
+static inline uint64 get_func_flags(ea_t ea)
+{
+  func_t *pfn = get_func(ea);
+  return pfn != nullptr ? pfn->flags : 0;
+}
+
+static inline void set_func_flag(ea_t ea, uint64 flags)
+{
+  func_t *pfn = get_func(ea);
+  if ( pfn != nullptr )
+  {
+    pfn->flags |= flags;
+    update_func(pfn);
+  }
+}
+
+static inline bool add_func_auto_stkpnt(ea_t func_ea, ea_t ea, sval_t delta)
+{
+  return add_auto_stkpnt(get_func(func_ea), ea, delta);
+}
+
+static inline bool add_frame_ea(ea_t func_ea, sval_t frsize, ushort frregs, asize_t argsize)
+{
+  return add_frame(get_func(func_ea), frsize, frregs, argsize);
+}
+
+static inline bool recalc_func_spd_for_basic_block(ea_t func_ea, ea_t cur_ea)
+{
+  return recalc_spd_for_basic_block(get_func(func_ea), cur_ea);
+}
 
 //----------------------------------------------------------------------
 // Resolve global base register symbols ($gp / $tp) if defined in the IDB

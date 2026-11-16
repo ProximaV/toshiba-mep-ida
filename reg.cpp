@@ -1,5 +1,6 @@
 #pragma warning ( disable : 4146)
 #include "mep.hpp"
+#include <idd.hpp>
 #include <typeinf.hpp>
 
 int data_id;
@@ -53,6 +54,88 @@ bool mep_t::get_repeat_loop(ea_t tail_ea, ea_t *p_rpb_ea, bool *p_is_erepeat) co
   if ( p_is_erepeat != nullptr )
     *p_is_erepeat = (encoded & 1) != 0;
   return true;
+}
+
+static int mep_resolve_reg_idx(const char *const *reg_names, int regs_num, const char *regname)
+{
+  if ( reg_names == nullptr || regname == nullptr || *regname == '\0' )
+    return -1;
+
+  auto find_exact = [&](const char *target) -> int
+  {
+    for ( int i = 0; i < regs_num; i++ )
+    {
+      if ( reg_names[i] != nullptr && strieq(reg_names[i], target) )
+        return i;
+    }
+    return -1;
+  };
+
+  // 1. Exact canonical match in ph.reg_names (note: skip index 0 "h-pc" unless asked explicitly)
+  int idx = find_exact(regname);
+  if ( idx >= 0 )
+  {
+    if ( idx == 0 )
+    {
+      int pc_idx = find_exact("$pc");
+      if ( pc_idx >= 0 )
+        return pc_idx;
+    }
+    return idx;
+  }
+
+  // 2. Explicit GPR / CSR aliases
+  struct reg_alias_t
+  {
+    const char *alias;
+    const char *canonical;
+  };
+  static const reg_alias_t kRegAliases[] =
+  {
+    { "h-pc",      "$pc"  },
+    { "r0",        "$0"   }, { "$r0",  "$0"  },
+    { "r1",        "$1"   }, { "$r1",  "$1"  },
+    { "r2",        "$2"   }, { "$r2",  "$2"  },
+    { "r3",        "$3"   },
+    { "r4",        "$4"   }, { "$r4",  "$4"  },
+    { "r5",        "$5"   }, { "$r5",  "$5"  },
+    { "r6",        "$6"   }, { "$r6",  "$6"  },
+    { "r7",        "$7"   }, { "$r7",  "$7"  },
+    { "r8",        "$8"   }, { "$r8",  "$8"  },
+    { "fp",        "$8"   }, { "$fp",  "$8"  },
+    { "r9",        "$9"   },
+    { "r10",       "$10"  },
+    { "r11",       "$11"  },
+    { "r12",       "$12"  }, { "$r12", "$12" },
+    { "r13",       "$tp"  }, { "$r13", "$tp" },
+    { "r14",       "$gp"  }, { "$r14", "$gp" },
+    { "r15",       "$sp"  }, { "$r15", "$sp" },
+    { "$h-csr-3",  "$r3"  },
+    { "$h-csr-9",  "$r9"  },
+    { "$h-csr-10", "$r10" },
+    { "$h-csr-11", "$r11" },
+    { "$h-csr-29", "$r29" },
+    { "$h-csr-30", "$r30" },
+    { "$h-csr-31", "$r31" },
+  };
+  for ( size_t i = 0; i < qnumber(kRegAliases); i++ )
+  {
+    if ( strieq(kRegAliases[i].alias, regname) )
+    {
+      int aliased = find_exact(kRegAliases[i].canonical);
+      if ( aliased >= 0 )
+        return aliased;
+    }
+  }
+
+  // 3. Bare names without leading '$' (e.g. "pc", "sp", "ivb", "ier")
+  for ( int i = 0; i < regs_num; i++ )
+  {
+    const char *rn = reg_names[i];
+    if ( rn != nullptr && rn[0] == '$' && strieq(rn + 1, regname) )
+      return i;
+  }
+  return -1;
 }
 
 ssize_t idaapi mep_t::on_event(ssize_t msgid, va_list va)
@@ -240,15 +323,17 @@ ssize_t idaapi mep_t::on_event(ssize_t msgid, va_list va)
         return 1;
       }
 
-    case processor_t::ev_create_function_frame:
+    case processor_t::ev_create_func_frame:
       {
-        ea_t func_ea = va_arg(va, ea_t);
-        return create_func_frame(func_ea) ? 1 : 0;
+        func_t *pfn = va_arg(va, func_t *);
+        return (pfn != nullptr && create_func_frame(pfn->start_ea)) ? 1 : 0;
       }
 
-    case processor_t::ev_get_function_retsize:
+    case processor_t::ev_get_frame_retsize:
       {
         int *frsize = va_arg(va, int *);
+        const func_t *pfn = va_arg(va, const func_t *);
+        qnotused(pfn);
         *frsize = 0; // MeP stores return address in $lp, not on stack at call
         return 1;
       }
@@ -273,6 +358,254 @@ ssize_t idaapi mep_t::on_event(ssize_t msgid, va_list va)
         }
       }
       break;
+
+    case processor_t::ev_next_exec_insn:
+      {
+        ea_t *target                      = va_arg(va, ea_t *);
+        ea_t ea                           = va_arg(va, ea_t);
+        int tid                           = va_arg(va, int);
+        processor_t::regval_getter_t *getreg = va_arg(va, processor_t::regval_getter_t *);
+        const regval_t *regvalues         = va_arg(va, const regval_t *);
+        qnotused(tid);
+        if ( target == nullptr || getreg == nullptr || regvalues == nullptr )
+          return 0;
+        insn_t ins;
+        if ( decode_insn(&ins, ea) <= 0 )
+          return 0;
+        ea_t next_ea = ea + ins.size;
+        auto reg32 = [&](int reg_idx) -> uint32
+        {
+          if ( reg_idx < 0 || reg_idx >= ph.regs_num || ph.reg_names[reg_idx] == nullptr )
+            return 0;
+          return (uint32)getreg(ph.reg_names[reg_idx], regvalues).ival;
+        };
+        switch ( ins.itype )
+        {
+          case MEP_INSN_BRA:
+          case MEP_INSN_JMP24:
+          case MEP_INSN_BSR12:
+          case MEP_INSN_BSR24:
+          case MEP_INSN_BSRV:
+            if ( ins.Op1.type == o_near )
+              next_ea = ins.Op1.addr;
+            break;
+          case MEP_INSN_JMP:
+          case MEP_INSN_JSR:
+          case MEP_INSN_JSRV:
+            if ( ins.Op1.type == o_near )
+              next_ea = ins.Op1.addr;
+            else if ( ins.Op1.type == o_reg )
+              next_ea = (ea_t)(reg32(ins.Op1.reg) & ~1u);
+            break;
+          case MEP_INSN_RET:
+            next_ea = (ea_t)(getreg("$lp", regvalues).ival & ~1ULL);
+            break;
+          case MEP_INSN_RETI:
+            {
+              uint64 psw = getreg("$psw", regvalues).ival;
+              next_ea = (ea_t)(getreg((psw & (1u << 2)) ? "$npc" : "$epc", regvalues).ival & ~1ULL);
+            }
+            break;
+          case MEP_INSN_DRET:
+            next_ea = (ea_t)(getreg("$depc", regvalues).ival & ~1ULL);
+            break;
+          case MEP_INSN_BEQZ:
+            if ( reg32(ins.Op1.reg) == 0 )
+              next_ea = ins.Op2.addr;
+            break;
+          case MEP_INSN_BNEZ:
+            if ( reg32(ins.Op1.reg) != 0 )
+              next_ea = ins.Op2.addr;
+            break;
+          case MEP_INSN_BEQI:
+            if ( reg32(ins.Op1.reg) == (uint32)ins.Op2.value )
+              next_ea = ins.Op3.addr;
+            break;
+          case MEP_INSN_BNEI:
+            if ( reg32(ins.Op1.reg) != (uint32)ins.Op2.value )
+              next_ea = ins.Op3.addr;
+            break;
+          case MEP_INSN_BLTI:
+            if ( (int32)reg32(ins.Op1.reg) < (int32)ins.Op2.value )
+              next_ea = ins.Op3.addr;
+            break;
+          case MEP_INSN_BGEI:
+            if ( (int32)reg32(ins.Op1.reg) >= (int32)ins.Op2.value )
+              next_ea = ins.Op3.addr;
+            break;
+          case MEP_INSN_BEQ:
+            if ( reg32(ins.Op1.reg) == reg32(ins.Op2.reg) )
+              next_ea = ins.Op3.addr;
+            break;
+          case MEP_INSN_BNE:
+            if ( reg32(ins.Op1.reg) != reg32(ins.Op2.reg) )
+              next_ea = ins.Op3.addr;
+            break;
+          default:
+            {
+              uint64 rpb = getreg("$rpb", regvalues).ival;
+              uint64 rpe = getreg("$rpe", regvalues).ival;
+              uint64 rpc = getreg("$rpc", regvalues).ival;
+              if ( (rpe & ~1ULL) != 0 && ea == (ea_t)(rpe & ~1ULL) )
+              {
+                if ( (rpe & 1ULL) != 0 || rpc > 1 )
+                  next_ea = (ea_t)(rpb & ~1ULL);
+              }
+            }
+            break;
+        }
+        *target = next_ea;
+        return 1;
+      }
+
+    case processor_t::ev_calc_step_over:
+      {
+        ea_t *target = va_arg(va, ea_t *);
+        ea_t ip      = va_arg(va, ea_t);
+        if ( target == nullptr || ip == BADADDR )
+          return 0;
+        insn_t ins;
+        if ( decode_insn(&ins, ip) > 0
+          && (ins.itype == MEP_INSN_BSR12
+           || ins.itype == MEP_INSN_BSR24
+           || ins.itype == MEP_INSN_JSR
+           || ins.itype == MEP_INSN_BSRV
+           || ins.itype == MEP_INSN_JSRV
+           || ins.itype == MEP_INSN_SWI) )
+        {
+          *target = ip + ins.size;
+          return 1;
+        }
+        *target = BADADDR;
+        return 1;
+      }
+
+    case processor_t::ev_get_idd_opinfo:
+      {
+        idd_opinfo_t *opinf                  = va_arg(va, idd_opinfo_t *);
+        ea_t ea                              = va_arg(va, ea_t);
+        int n                                = va_arg(va, int);
+        int thread_id                        = va_arg(va, int);
+        processor_t::regval_getter_t *getreg = va_arg(va, processor_t::regval_getter_t *);
+        const regval_t *regvalues            = va_arg(va, const regval_t *);
+        qnotused(thread_id);
+        if ( opinf == nullptr )
+          return 0;
+        opinf->ea = BADADDR;
+        opinf->debregidx = -1;
+        opinf->modified = false;
+        opinf->value.ival = 0;
+        opinf->value_size = 4;
+        insn_t ins;
+        if ( decode_insn(&ins, ea) <= 0 || n < 0 || n >= UA_MAXOP )
+          return 0;
+        const op_t &op = ins.ops[n];
+        if ( op.type == o_void )
+          return 0;
+
+        auto map_idd_reg = [&](int reg_idx, const char **out_name, int *out_dbg_idx) -> bool
+        {
+          if ( reg_idx >= REGS_HW_H_GPR_BASE && reg_idx < REGS_HW_H_GPR_BASE + 16 )
+          {
+            *out_dbg_idx = reg_idx - REGS_HW_H_GPR_BASE;
+            *out_name = ph.reg_names[reg_idx];
+            return *out_name != nullptr;
+          }
+          if ( reg_idx >= REGS_HW_H_CSR_BASE && reg_idx < REGS_HW_H_CSR_BASE + 32 )
+          {
+            static const char *const kCsrDbgNames[32] =
+            {
+              "$pc",  "$lp",  "$sar", "$r3",  "$rpb", "$rpe", "$rpc", "$hi",
+              "$lo",  "$r9",  "$r10", "$r11", "$mb0", "$me0", "$mb1", "$me1",
+              "$psw", "$id",  "$tmp", "$epc", "$exc", "$cfg", "$vid", "$npc",
+              "$dbg", "$depc","$opt", "$rcfg","$ccfg","$r29", "$r30", "$r31",
+            };
+            const int csr_idx = reg_idx - REGS_HW_H_CSR_BASE;
+            *out_dbg_idx = 16 + csr_idx;
+            *out_name = kCsrDbgNames[csr_idx];
+            return true;
+          }
+          if ( reg_idx == REGS_HW_H_PC_BASE )
+          {
+            *out_dbg_idx = 16;
+            *out_name = "$pc";
+            return true;
+          }
+          return false;
+        };
+
+        switch ( op.type )
+        {
+          case o_reg:
+            {
+              const char *rname = nullptr;
+              int dbg_idx = -1;
+              if ( map_idd_reg(op.reg, &rname, &dbg_idx) )
+              {
+                opinf->debregidx = dbg_idx;
+                if ( getreg != nullptr && regvalues != nullptr )
+                  opinf->value = getreg(rname, regvalues);
+                return 1;
+              }
+              if ( op.reg < ph.regs_num && ph.reg_names[op.reg] != nullptr && getreg != nullptr && regvalues != nullptr )
+              {
+                opinf->value = getreg(ph.reg_names[op.reg], regvalues);
+                return 1;
+              }
+            }
+            break;
+          case o_near:
+          case o_mem:
+            opinf->ea = op.addr;
+            return 1;
+          case o_imm:
+            opinf->value.ival = op.value;
+            return 1;
+          case o_displ:
+            {
+              const char *rname = nullptr;
+              int dbg_idx = -1;
+              if ( map_idd_reg(op.reg, &rname, &dbg_idx) && getreg != nullptr && regvalues != nullptr )
+              {
+                uint32 base = (uint32)getreg(rname, regvalues).ival;
+                opinf->ea = (ea_t)(base + (int32)op.addr);
+                return 1;
+              }
+              if ( op.reg < ph.regs_num && ph.reg_names[op.reg] != nullptr && getreg != nullptr && regvalues != nullptr )
+              {
+                uint32 base = (uint32)getreg(ph.reg_names[op.reg], regvalues).ival;
+                opinf->ea = (ea_t)(base + (int32)op.addr);
+                return 1;
+              }
+            }
+            break;
+          default:
+            break;
+        }
+        return 0;
+      }
+
+    case processor_t::ev_str2reg:
+      {
+        const char *regname = va_arg(va, const char *);
+        int idx = mep_resolve_reg_idx(ph.reg_names, ph.regs_num, regname);
+        return idx >= 0 ? (idx + 1) : 0;
+      }
+
+    case processor_t::ev_get_reg_info:
+      {
+        const char **main_regname = va_arg(va, const char **);
+        bitrange_t *bitrange      = va_arg(va, bitrange_t *);
+        const char *regname       = va_arg(va, const char *);
+        int idx = mep_resolve_reg_idx(ph.reg_names, ph.regs_num, regname);
+        if ( idx < 0 )
+          return -1;
+        if ( main_regname != nullptr )
+          *main_regname = ph.reg_names[idx];
+        if ( bitrange != nullptr )
+          *bitrange = bitrange_t(0, 32);
+        return 1;
+      }
 
     default:
       break;
